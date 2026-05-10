@@ -367,11 +367,33 @@ _last_tier:       dict[str, int] = {}              # session_id -> current assig
 _base_tier:       dict[str, int] = {}              # session_id -> tier for this turn (before escalation)
 _tool_errors:     dict[str, int] = {}              # session_id -> consecutive tool error count this turn
 _escalated:       dict[str, bool] = {}             # session_id -> True if we already escalated mid-turn
+_live_agents:     dict[str, Any] = {}              # session_id -> active agent bound by WebUI/CLI bridge
 _state_lock = threading.Lock()
 
 def get_last_tier(session_id: str) -> int:
     with _state_lock:
         return _last_tier.get(session_id, 0)
+
+
+def bind_session_agent(session_id: str, agent: Any) -> None:
+    """Bind a live agent instance to a session so WebUI turns are steerable."""
+    if not session_id or agent is None:
+        return
+    with _state_lock:
+        _live_agents[session_id] = agent
+
+
+def unbind_session_agent(session_id: str, agent: Any | None = None) -> None:
+    """Remove a previously bound live agent when a WebUI turn ends."""
+    if not session_id:
+        return
+    with _state_lock:
+        current = _live_agents.get(session_id)
+        if current is None:
+            return
+        if agent is not None and current is not agent:
+            return
+        _live_agents.pop(session_id, None)
 
 
 def is_session_pinned(session_id: str) -> bool:
@@ -482,6 +504,146 @@ def _patch_status_bar(cli) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live agent / routing helpers
+# ---------------------------------------------------------------------------
+
+def _get_live_agent(session_id: str = "") -> Any | None:
+    """Return the active agent for this session from CLI or WebUI bindings."""
+    with _state_lock:
+        bound_agent = _live_agents.get(session_id) if session_id else None
+    if bound_agent is not None:
+        return bound_agent
+
+    if _manager_ref is None:
+        return None
+    try:
+        cli = _manager_ref._cli_ref
+        agent = getattr(cli, "agent", None) if cli else None
+        if agent is None:
+            return None
+        if not session_id:
+            return agent
+        agent_session = getattr(agent, "session_id", "") or ""
+        return agent if agent_session == session_id else None
+    except Exception:
+        return None
+
+
+def _target_tier_for_turn(session_id: str, msg: str, history: list, current_model: str) -> tuple[int, bool]:
+    """Return (target_tier, is_new_user_turn) for the current message."""
+    with _state_lock:
+        last_entry = _session_last.get(session_id)
+        is_new_user_turn = (last_entry is None) or (last_entry[0] != msg)
+
+    if is_new_user_turn:
+        with _state_lock:
+            _tool_errors[session_id] = 0
+            _escalated[session_id] = False
+
+        explicit = _detect_explicit_tier(msg)
+        if explicit is not None:
+            target_tier = explicit
+            _set_cached_tier(session_id, msg, target_tier)
+            logger.info("model-router: explicit T%d request honoured", target_tier)
+        elif _is_obvious_ack(msg):
+            target_tier = 1
+            _set_cached_tier(session_id, msg, target_tier)
+        else:
+            target_tier = _classify_with_flash(msg, history)
+            _set_cached_tier(session_id, msg, target_tier)
+
+        with _state_lock:
+            _base_tier[session_id] = target_tier
+            _last_tier[session_id] = target_tier
+        return target_tier, True
+
+    with _state_lock:
+        return _last_tier.get(session_id, 2), False
+
+
+def prepare_turn(
+    *,
+    session_id: str,
+    user_message: str,
+    conversation_history: list | None = None,
+    current_model: str = "",
+    platform: str = "",
+    apply_live: bool = False,
+) -> dict[str, Any]:
+    """Classify the turn and optionally apply the routed tier to a live agent."""
+    msg = user_message.strip()
+    if not msg:
+        return {
+            "session_id": session_id,
+            "pinned": is_session_pinned(session_id),
+            "tier": get_last_tier(session_id) or MODEL_TO_TIER.get(current_model, 0),
+            "model": current_model,
+            "reasoning": None,
+            "platform": platform,
+            "is_new_turn": False,
+        }
+
+    history = conversation_history or []
+    actual_model = current_model
+    agent = _get_live_agent(session_id)
+    if agent is not None:
+        actual_model = getattr(agent, "model", actual_model) or actual_model
+
+    if _is_manual_override(session_id, actual_model):
+        logger.debug("model-router: manual override active (%s), skipping", actual_model)
+        return {
+            "session_id": session_id,
+            "pinned": True,
+            "tier": MODEL_TO_TIER.get(actual_model, get_last_tier(session_id)),
+            "model": actual_model,
+            "reasoning": getattr(agent, "reasoning_config", None) if agent is not None else None,
+            "platform": platform,
+            "is_new_turn": False,
+        }
+
+    target_tier, is_new_user_turn = _target_tier_for_turn(session_id, msg, history, actual_model)
+    target_meta = TIERS.get(target_tier, {})
+    target_model = str(target_meta.get("model", "") or actual_model)
+    target_reasoning = target_meta.get("reasoning")
+
+    logger.debug(
+        "model-router: turn T%d -> model=%s vs actual=%s",
+        target_tier, target_model, actual_model,
+    )
+
+    if apply_live:
+        if target_model != actual_model:
+            logger.info(
+                "model-router: switching T%d (was T%d / %s)",
+                target_tier,
+                MODEL_TO_TIER.get(actual_model, 0),
+                actual_model.split("/")[-1] if actual_model else "unknown",
+            )
+            _apply_tier(session_id, target_tier, actual_model, source="")
+        else:
+            try:
+                cli = _manager_ref._cli_ref if _manager_ref is not None else None
+                if cli:
+                    _patch_status_bar(cli)
+            except Exception:
+                pass
+    elif agent is not None and target_model != actual_model:
+        # WebUI may pre-resolve the routed model before the hook fires; if a
+        # reused cached agent still carries the old model, normalize it here.
+        _apply_tier(session_id, target_tier, actual_model, source="webui-sync")
+
+    return {
+        "session_id": session_id,
+        "pinned": False,
+        "tier": target_tier,
+        "model": target_model,
+        "reasoning": target_reasoning,
+        "platform": platform,
+        "is_new_turn": is_new_user_turn,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Apply model switch helper
 # ---------------------------------------------------------------------------
 
@@ -505,8 +667,8 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
         pass
 
     try:
-        cli   = _manager_ref._cli_ref
-        agent = getattr(cli, "agent", None) if cli else None
+        cli = _manager_ref._cli_ref
+        agent = _get_live_agent(session_id)
         if agent is None:
             return
 
@@ -560,104 +722,17 @@ def on_pre_llm_call(
     platform: str = "",
     **kwargs: Any,
 ) -> None:
-
     if _manager_ref is None:
         return
 
-    msg = user_message.strip()
-    if not msg:
-        return
-
-    history = conversation_history or []
-
-    # Get live agent.model instead of relying on stale 'model' parameter
-    # (model parameter is from plugin hook context and may lag behind actual agent state)
-    actual_model = model
-    try:
-        cli = _manager_ref._cli_ref
-        if cli:
-            agent = getattr(cli, "agent", None)
-            if agent:
-                actual_model = agent.model
-    except Exception as exc:
-        logger.debug("model-router: failed to get live agent.model: %s", exc)
-
-    # Respektuj ręczny override
-    if _is_manual_override(session_id, actual_model):
-        logger.debug("model-router: manual override active (%s), skipping", actual_model)
-        return
-
-    # ── Determine whether this is a "new user turn" vs tool-loop iteration ───
-    #
-    # IMPORTANT: Hermes passes is_first_turn=True ONLY when conversation_history
-    # is empty (i.e. the very first turn of the entire session).  Every subsequent
-    # user turn arrives with is_first_turn=False because conversation_history is
-    # already populated.  We therefore cannot rely on is_first_turn to detect a
-    # new user message.
-    #
-    # Instead we track the last message text we classified per session.  If msg
-    # differs from the last classified message this is definitely a new user turn
-    # and we re-classify.  If msg is the same we are inside the tool-calling loop
-    # for the same turn and we only need to confirm escalation state.
-    with _state_lock:
-        last_entry = _session_last.get(session_id)
-        is_new_user_turn = (last_entry is None) or (last_entry[0] != msg)
-
-    if is_new_user_turn:
-        # Reset per-turn error counters
-        with _state_lock:
-            _tool_errors[session_id] = 0
-            _escalated[session_id]   = False
-
-        # 1. Explicit user request? (e.g. "T3 pls", "a T2 jesteś tu?")
-        explicit = _detect_explicit_tier(msg)
-        if explicit is not None:
-            target_tier = explicit
-            _set_cached_tier(session_id, msg, target_tier)
-            logger.info("model-router: explicit T%d request honoured", target_tier)
-        elif _is_obvious_ack(msg):
-            target_tier = 1
-            _set_cached_tier(session_id, msg, target_tier)
-        else:
-            # No explicit hint — classify with Flash
-            target_tier = _classify_with_flash(msg, history)
-            _set_cached_tier(session_id, msg, target_tier)
-
-        with _state_lock:
-            _base_tier[session_id] = target_tier
-            _last_tier[session_id] = target_tier
-
-        # Apply only if different from current model
-        logger.debug(
-            "model-router: turn T%d -> model=%s vs actual=%s",
-            target_tier, TIERS[target_tier]["model"], actual_model
-        )
-        if TIERS[target_tier]["model"] != actual_model:
-            logger.info(
-                "model-router: switching T%d (was T%d / %s)",
-                target_tier, MODEL_TO_TIER.get(actual_model, 0), actual_model.split("/")[-1]
-            )
-            _apply_tier(session_id, target_tier, actual_model, source="")
-        else:
-            # Same model -- still update status bar patch and tier registry
-            with _state_lock:
-                _last_tier[session_id] = target_tier
-            try:
-                cli = _manager_ref._cli_ref
-                if cli:
-                    _patch_status_bar(cli)
-            except Exception:
-                pass
-
-    else:
-        # ── Tool-loop iteration for the same user turn ────────────────────────
-        # Self-escalation is handled by on_post_tool_call.  Here we just confirm
-        # that any mid-loop escalation is still reflected in the active model.
-        with _state_lock:
-            tier = _last_tier.get(session_id, 2)
-        if TIERS[tier]["model"] != actual_model:
-            # Escalation was applied mid-loop — confirm the switch is still live
-            _apply_tier(session_id, tier, actual_model, source="escalated")
+    prepare_turn(
+        session_id=session_id,
+        user_message=user_message,
+        conversation_history=conversation_history,
+        current_model=model,
+        platform=platform,
+        apply_live=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -724,12 +799,8 @@ def on_post_tool_call(
             _last_tier[session_id] = new_tier
             _tool_errors[session_id] = 0  # Reset counter so next 2 errors can trigger another escalation
 
-        try:
-            cli   = _manager_ref._cli_ref
-            agent = getattr(cli, "agent", None) if cli else None
-            current_model = agent.model if agent else TIERS[current_tier]["model"]
-        except Exception:
-            current_model = TIERS[current_tier]["model"]
+        agent = _get_live_agent(session_id)
+        current_model = getattr(agent, "model", TIERS[current_tier]["model"]) if agent else TIERS[current_tier]["model"]
 
         logger.info(
             "model-router: self-escalating T%d->T%d after %d tool errors",
@@ -762,8 +833,7 @@ def on_post_llm_call(
         return
 
     try:
-        cli   = _manager_ref._cli_ref
-        agent = getattr(cli, "agent", None) if cli else None
+        agent = _get_live_agent(session_id)
         if agent is None:
             return
 
@@ -842,6 +912,9 @@ def register(ctx) -> None:
     mgr.router_is_pinned     = is_session_pinned
     mgr.router_get_tier      = get_last_tier
     mgr.router_get_tier_meta = get_tier_meta
+    mgr.router_prepare_turn  = prepare_turn
+    mgr.router_bind_agent    = bind_session_agent
+    mgr.router_unbind_agent  = unbind_session_agent
 
     logger.info(
         "model-router: registered -- Flash T1-T5 routing | explicit hints | "

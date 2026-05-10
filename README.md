@@ -60,6 +60,8 @@ Restart Hermes after installation.
 
 `install.sh` is safe to run repeatedly. It repairs and validates the required Hermes core patches, refreshes the global `hermes` launcher, ensures the plugin is enabled, normalizes `model_router.yaml`, syncs `auxiliary.triage_specifier`, and regenerates `skill_routing.md` plus the managed routing block in `SOUL.md`.
 
+If a local `hermes-webui` checkout is detected, `install.sh` also patches its API and static UI so model-router prepares each WebUI turn before agent startup, owns the live agent during streaming, and exposes native tier controls without the noisy "CLI-only command" chat messages.
+
 Before rewriting managed Hermes core files or the launcher, it creates timestamped backups.
 
 **Important:** If you move or rename the plugin directory after installation, re-run `bash install.sh` from the new location to re-sync the canonical plugin path and all profile symlinks.
@@ -138,6 +140,8 @@ tiers:
   5:
     model: anthropic/claude-sonnet-4.5
     reasoning: medium
+integrations:
+  hermes_webui_dir: ""
 ```
 
 ## Runtime Notes
@@ -146,6 +150,22 @@ tiers:
 - You can hint tiers in user text with `T1` to `T5`, `tier1` to `tier5`, or `tier 1` to `tier 5`.
 - `/model`, `/t1` to `/t5`, and `/auto` work at session scope.
 - The active tier is shown in the CLI status bar.
+- In `hermes-webui`, the composer model dropdown auto-detects model-router and renders native `Auto`, `T1` to `T5` rows showing the configured target models for the active profile.
+
+## Hermes WebUI Integration
+
+- Auto-detects a `hermes-webui` checkout in common locations like `~/.hermes/hermes-webui`, `~/GitHub/hermes-webui`, `~/code/hermes-webui`, and similar.
+- If `model_router.yaml` contains `integrations.hermes_webui_dir`, that path is checked first and wins over env vars and auto-detect when it points to a real checkout.
+- Patches `api/routes.py`, `api/streaming.py`, `static/commands.js`, `static/ui.js`, and `static/style.css` only when a real `hermes-webui` repo is found.
+- Adds local WebUI command handlers for `/t1` to `/t5` and `/auto`, so those commands work quietly instead of falling through to the generic WebUI "CLI-only" warning.
+- Adds a `Model Router` section inside the composer model dropdown with native rows for `Auto` and `T1` to `T5`, showing the configured model slug and reasoning level for the active profile.
+- Makes WebUI ask model-router for the turn model before spawning the stream, so WebUI defaults no longer override routed tiers during actual API calls.
+- If your WebUI checkout lives somewhere unusual, point the installer at it with `HERMES_WEBUI_DIR=/path/to/hermes-webui bash install.sh`.
+- Example config override:
+```yaml
+integrations:
+  hermes_webui_dir: /absolute/path/to/hermes-webui
+```
 
 ## Auto-Escalation & De-escalation
 

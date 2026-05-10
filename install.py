@@ -79,7 +79,7 @@ DEFAULT_ROUTER_CONFIG = {
             "label": "T4 DeepSeek Pro",
             "emoji": "🔸",
             "model": "deepseek/deepseek-v4-pro",
-            "reasoning": high,
+            "reasoning": "high",
             "role": "strong reasoning and synthesis",
             "best_for": [
                 "Architecture",
@@ -100,6 +100,9 @@ DEFAULT_ROUTER_CONFIG = {
                 "High-stakes reasoning",
             ],
         },
+    },
+    "integrations": {
+        "hermes_webui_dir": "",
     },
 }
 
@@ -290,6 +293,961 @@ CLI_INLINE_ROUTING_BLOCK = """                # Handle /model directly on the UI
 
 """
 
+WEBUI_REQUIRED_FILES = (
+    "api/routes.py",
+    "api/streaming.py",
+    "static/index.html",
+    "static/commands.js",
+    "static/messages.js",
+    "static/ui.js",
+    "static/style.css",
+)
+WEBUI_ENV_VARS = (
+    "HERMES_WEBUI_DIR",
+    "HERMES_WEBUI_ROOT",
+    "HERMES_WEBUI_HOME",
+)
+WEBUI_COMMANDS_ROUTER_HELPERS_BLOCK = """function _getModelRouterAgentCommands(agentCommands){
+  const commands=Array.isArray(agentCommands)?agentCommands:[];
+  const wanted=new Set(['auto','t1','t2','t3','t4','t5']);
+  return commands
+    .filter(cmd=>{
+      const name=String(cmd&&cmd.name||'').toLowerCase();
+      return wanted.has(name)&&!cmd.cli_only&&!cmd.gateway_only;
+    })
+    .map(cmd=>({
+      name:String(cmd.name||'').toLowerCase(),
+      desc:String(cmd.description||'').trim()||'model-router session command',
+      source:'agent',
+      noEcho:false,
+    }))
+    .sort((a,b)=>{
+      const order={auto:0,t1:1,t2:2,t3:3,t4:4,t5:5};
+      return (order[a.name]??99)-(order[b.name]??99);
+    });
+}
+
+"""
+WEBUI_COMMANDS_ROUTER_MATCH_BLOCK_OLD = """  if(parsed.kind==='commands') return getMatchingCommands(parsed.query);
+"""
+WEBUI_COMMANDS_ROUTER_MATCH_BLOCK_NEW = """  if(parsed.kind==='commands'){
+    const matches=getMatchingCommands(parsed.query);
+    const seen=new Set(matches.map(c=>c.name));
+    const agentCommands=(typeof loadAgentCommandMetadata==='function')
+      ? await loadAgentCommandMetadata()
+      : [];
+    for(const cmd of _getModelRouterAgentCommands(agentCommands)){
+      if(!cmd.name.startsWith(parsed.query)||seen.has(cmd.name)) continue;
+      matches.push(cmd);
+      seen.add(cmd.name);
+    }
+    return matches;
+  }
+"""
+WEBUI_COMMANDS_ROUTER_COMMANDS_OLD = """  {name:'model',     desc:t('cmd_model'),  fn:cmdModel,     arg:'model_name', subArgs:'models', noEcho:true},
+"""
+WEBUI_COMMANDS_ROUTER_COMMANDS_NEW = """  {name:'model',     desc:t('cmd_model'),  fn:cmdModel,     arg:'model_name', subArgs:'models', noEcho:true},
+  {name:'auto',      desc:'Resume model-router auto routing for this session', fn:cmdRouterAuto, noEcho:true},
+  {name:'t1',        desc:'Pin this conversation to the configured T1 router slot', fn:()=>cmdRouterTier(1), noEcho:true},
+  {name:'t2',        desc:'Pin this conversation to the configured T2 router slot', fn:()=>cmdRouterTier(2), noEcho:true},
+  {name:'t3',        desc:'Pin this conversation to the configured T3 router slot', fn:()=>cmdRouterTier(3), noEcho:true},
+  {name:'t4',        desc:'Pin this conversation to the configured T4 router slot', fn:()=>cmdRouterTier(4), noEcho:true},
+  {name:'t5',        desc:'Pin this conversation to the configured T5 router slot', fn:()=>cmdRouterTier(5), noEcho:true},
+"""
+WEBUI_COMMANDS_ROUTER_HELPERS_BLOCK_V2 = """async function _runModelRouterCommand(action, tierNum){
+  const hasWindow=typeof window!=='undefined';
+  const applyTier=hasWindow?window._modelRouterApplyTier:null;
+  const resumeAuto=hasWindow?window._modelRouterResumeAuto:null;
+  if(action==='auto'&&typeof resumeAuto!=='function'){
+    if(typeof showToast==='function') showToast('Model Router integration is not available in this WebUI.', 3000);
+    return;
+  }
+  if(action==='pin'&&typeof applyTier!=='function'){
+    if(typeof showToast==='function') showToast('Model Router integration is not available in this WebUI.', 3000);
+    return;
+  }
+  try{
+    const result=action==='auto'
+      ? await resumeAuto()
+      : await applyTier(Number(tierNum)||0);
+    const sessionState=result&&result.router&&result.router.session?result.router.session:null;
+    const activeTier=sessionState&&sessionState.active_tier?sessionState.active_tier:null;
+    let message='Model Router updated';
+    if(action==='auto'){
+      message='Model Router: auto-routing resumed';
+    }else if(activeTier&&activeTier.model){
+      message=`Model Router: pinned to ${activeTier.label||('T'+tierNum)} (${activeTier.model})`;
+    }else{
+      message=`Model Router: pinned to T${tierNum}`;
+    }
+    if(typeof showToast==='function') showToast(message, 2600);
+  }catch(e){
+    const detail=e&&e.message?e.message:String(e||'Unknown error');
+    if(typeof showToast==='function') showToast(`Model Router failed: ${detail}`, 3600);
+  }
+}
+
+async function cmdRouterAuto(){
+  return _runModelRouterCommand('auto', 0);
+}
+
+async function cmdRouterTier(tierNum){
+  return _runModelRouterCommand('pin', Number(tierNum)||0);
+}
+
+"""
+WEBUI_UI_ROUTER_HELPERS_BLOCK_LEGACY = """function _getModelRouterCommandSpecs(){
+  const commands=Array.isArray(_agentCommandCache)?_agentCommandCache:[];
+  const order=['auto','t1','t2','t3','t4','t5'];
+  const labels={auto:'Auto',t1:'T1',t2:'T2',t3:'T3',t4:'T4',t5:'T5'};
+  const specs=[];
+  for(const name of order){
+    const cmd=commands.find(entry=>String(entry&&entry.name||'').toLowerCase()===name);
+    if(!cmd||cmd.cli_only||cmd.gateway_only) continue;
+    specs.push({
+      name,
+      label:labels[name]||name.toUpperCase(),
+      desc:String(cmd.description||'').trim()||`/${name}`,
+    });
+  }
+  return specs;
+}
+
+function _scheduleModelRouterMetadataRefresh(){
+  if(typeof loadAgentCommandMetadata!=='function') return;
+  if(window._modelRouterMetadataPending) return;
+  window._modelRouterMetadataPending=true;
+  loadAgentCommandMetadata()
+    .then(()=>{ if(typeof _refreshOpenModelDropdown==='function') _refreshOpenModelDropdown(); })
+    .catch(()=>{})
+    .finally(()=>{ window._modelRouterMetadataPending=false; });
+}
+
+async function _sendModelRouterCommand(name){
+  const command=String(name||'').trim().toLowerCase();
+  if(!command||typeof send!=='function') return;
+  const input=$('msg');
+  if(!input) return;
+  closeModelDropdown();
+  input.value=`/${command}`;
+  if(typeof autoResize==='function') autoResize();
+  try{
+    await send();
+  }catch(e){
+    if(typeof showToast==='function') showToast(`Failed to run /${command}: ${e.message||e}`, 3000);
+  }
+}
+
+function _appendModelRouterActions(container){
+  if(!container) return;
+  const specs=_getModelRouterCommandSpecs();
+  if(!specs.length){
+    _scheduleModelRouterMetadataRefresh();
+    return;
+  }
+  const heading=document.createElement('div');
+  heading.className='model-group model-router-group';
+  heading.textContent='Model Router';
+
+  const note=document.createElement('div');
+  note.className='model-router-note';
+  note.textContent='Uses the existing /t1-/t5 and /auto session commands.';
+
+  const row=document.createElement('div');
+  row.className='model-router-actions';
+  for(const spec of specs){
+    const btn=document.createElement('button');
+    btn.type='button';
+    btn.className='model-router-action';
+    btn.textContent=spec.label;
+    btn.title=spec.desc;
+    btn.onclick=(event)=>{
+      event.preventDefault();
+      event.stopPropagation();
+      void _sendModelRouterCommand(spec.name);
+    };
+    row.appendChild(btn);
+  }
+
+  container.appendChild(heading);
+  container.appendChild(note);
+  container.appendChild(row);
+}
+
+"""
+WEBUI_UI_ROUTER_HELPERS_BLOCK = """function _modelRouterUiSessionId(){
+  return (S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+}
+
+function _getModelRouterUiState(){
+  return (typeof window!=='undefined'&&window._modelRouterUiState&&typeof window._modelRouterUiState==='object')
+    ? window._modelRouterUiState
+    : null;
+}
+
+function _getModelRouterUiSessionState(){
+  const state=_getModelRouterUiState();
+  const sid=_modelRouterUiSessionId();
+  if(!state||!state.session) return null;
+  if(sid&&state.session.session_id&&state.session.session_id!==sid) return null;
+  return state.session;
+}
+
+function _normalizeModelRouterModelId(value){
+  return String(value||'').trim().toLowerCase();
+}
+
+function _findModelRouterTierByModel(modelId){
+  const state=_getModelRouterUiState();
+  const tiers=state&&Array.isArray(state.tiers)?state.tiers:[];
+  const needle=_normalizeModelRouterModelId(modelId);
+  if(!needle) return null;
+  for(const tier of tiers){
+    if(_normalizeModelRouterModelId(tier&&tier.model)===needle) return tier;
+  }
+  return null;
+}
+
+function _modelRouterCurrentTurnModel(modelId,routing){
+  const routed=String(routing&&routing.used_model||'').trim();
+  if(routed) return routed;
+  const turnModel=String(S&&S.session&&S.session.model_router_turn_model||'').trim();
+  if(turnModel) return turnModel;
+  const current=String(S&&S.session&&S.session.model||'').trim();
+  if(current) return current;
+  return String(modelId||'').trim();
+}
+
+function _formatModelRouterChipLabel(modelId,labelText,routing){
+  const state=_getModelRouterUiState();
+  const sessionState=_getModelRouterUiSessionState();
+  if(S&&S.session&&(!state||!sessionState||(state.session==null))) _scheduleModelRouterUiRefresh();
+  if(!state||!state.enabled) return '';
+  if(!sessionState) return '';
+  const running=!!(S&&S.busy);
+  if(!sessionState.pinned){
+    if(!running) return 'Auto';
+    const currentModel=_modelRouterCurrentTurnModel(modelId,routing);
+    const tier=_findModelRouterTierByModel(currentModel);
+    const parts=['Auto'];
+    if(tier&&tier.short_label) parts.push(tier.short_label);
+    else if(tier&&tier.tier) parts.push(`T${tier.tier}`);
+    if(currentModel) parts.push(currentModel);
+    return parts.join(' · ');
+  }
+  const pinnedTier=sessionState.active_tier||_findModelRouterTierByModel(modelId)||_findModelRouterTierByModel(S&&S.session&&S.session.model||'');
+  if(!pinnedTier) return '';
+  const pinnedShort=String(pinnedTier.short_label||`T${pinnedTier.tier||''}`).trim();
+  const pinnedModel=String(pinnedTier.model||modelId||S&&S.session&&S.session.model||'').trim();
+  return pinnedModel?`${pinnedShort} · ${pinnedModel}`:pinnedShort;
+}
+
+function _modelRouterChipTitle(modelId,routing){
+  const state=_getModelRouterUiState();
+  const sessionState=_getModelRouterUiSessionState();
+  if(S&&S.session&&(!state||!sessionState||(state.session==null))) _scheduleModelRouterUiRefresh();
+  if(!state||!state.enabled||!sessionState) return '';
+  if(!sessionState.pinned){
+    if(!(S&&S.busy)) return 'Model Router auto-routing';
+    const currentModel=_modelRouterCurrentTurnModel(modelId,routing);
+    const tier=_findModelRouterTierByModel(currentModel);
+    const tierText=tier?(tier.label||tier.short_label||`T${tier.tier||''}`):'';
+    return currentModel
+      ? `Model Router auto-routing${tierText?` (${tierText})`:''}: ${currentModel}`
+      : 'Model Router auto-routing';
+  }
+  const pinnedTier=sessionState.active_tier||_findModelRouterTierByModel(modelId)||_findModelRouterTierByModel(S&&S.session&&S.session.model||'');
+  if(!pinnedTier) return 'Model Router pinned';
+  return `Model Router pinned: ${pinnedTier.label||pinnedTier.short_label||`T${pinnedTier.tier||''}`} -> ${pinnedTier.model||modelId||''}`;
+}
+
+async function _loadModelRouterUiState(force=false){
+  const sid=_modelRouterUiSessionId();
+  if(!force&&window._modelRouterUiState&&window._modelRouterUiStateSessionKey===sid){
+    return window._modelRouterUiState;
+  }
+  if(!force&&window._modelRouterUiStatePromise&&window._modelRouterUiStatePromiseSessionKey===sid){
+    return window._modelRouterUiStatePromise;
+  }
+  const query=sid?`?session_id=${encodeURIComponent(sid)}`:'';
+  window._modelRouterUiStatePromiseSessionKey=sid;
+  window._modelRouterUiStatePromise=api(`/api/model-router${query}`)
+    .then(data=>{
+      const state=(data&&typeof data==='object')?data:{enabled:false,tiers:[],session:null};
+      window._modelRouterUiState=state;
+      window._modelRouterUiStateSessionKey=sid;
+      return state;
+    })
+    .catch(()=>{
+      const state={enabled:false,tiers:[],session:sid?{session_id:sid,pinned:false,auto_routing:true,selected_tier:null,active_tier:null}:null};
+      window._modelRouterUiState=state;
+      window._modelRouterUiStateSessionKey=sid;
+      return state;
+    })
+    .finally(()=>{
+      window._modelRouterUiStatePromise=null;
+      window._modelRouterUiStatePromiseSessionKey='';
+    });
+  return window._modelRouterUiStatePromise;
+}
+
+function _scheduleModelRouterUiRefresh(){
+  if(window._modelRouterUiRefreshPending) return;
+  window._modelRouterUiRefreshPending=true;
+  _loadModelRouterUiState(true)
+    .then(()=>{
+      if(typeof syncModelChip==='function') syncModelChip();
+      if(typeof _refreshOpenModelDropdown==='function') _refreshOpenModelDropdown();
+    })
+    .catch(()=>{})
+    .finally(()=>{ window._modelRouterUiRefreshPending=false; });
+}
+
+async function _postModelRouterAction(action, tierNum){
+  if((!S.session||!S.session.session_id)&&typeof newSession==='function'){
+    await newSession();
+    if(typeof renderSessionList==='function') await renderSessionList();
+  }
+  const sid=_modelRouterUiSessionId();
+  if(!sid) throw new Error('No active conversation');
+  const payload={session_id:sid,action};
+  if(action==='pin') payload.tier=Number(tierNum)||0;
+  const data=await api('/api/model-router/session',{method:'POST',body:JSON.stringify(payload)});
+  if(data&&data.session){
+    S.session=data.session;
+    if(typeof syncTopbar==='function') syncTopbar();
+    if(typeof syncModelChip==='function') syncModelChip();
+    if(typeof renderSessionList==='function') await renderSessionList();
+  }
+  if(data&&data.router){
+    window._modelRouterUiState=data.router;
+    window._modelRouterUiStateSessionKey=sid;
+  }else{
+    await _loadModelRouterUiState(true);
+  }
+  if(typeof _refreshOpenModelDropdown==='function') _refreshOpenModelDropdown();
+  return data;
+}
+
+async function _applyModelRouterTierFromUi(tierNum){
+  closeModelDropdown();
+  return _postModelRouterAction('pin', tierNum);
+}
+
+async function _resumeModelRouterAutoFromUi(){
+  closeModelDropdown();
+  return _postModelRouterAction('auto', 0);
+}
+
+function _appendModelRouterActions(container){
+  if(!container) return;
+  const state=_getModelRouterUiState();
+  if(!state){
+    _scheduleModelRouterUiRefresh();
+    return;
+  }
+  const tiers=Array.isArray(state.tiers)?state.tiers:[];
+  if(!state.enabled||!tiers.length) return;
+  const sessionState=_getModelRouterUiSessionState();
+  const heading=document.createElement('div');
+  heading.className='model-group model-router-group';
+  heading.textContent='Model Router';
+
+  const note=document.createElement('div');
+  note.className='model-router-note';
+  note.textContent=sessionState&&sessionState.pinned
+    ? 'Pinned tiers stop auto-routing until you choose Auto.'
+    : 'Auto uses model-router on the next turn. Tier rows pin the session.';
+
+  const autoRow=document.createElement('div');
+  autoRow.className='model-opt model-router-opt'+((sessionState&&!sessionState.pinned)?' active':'');
+  autoRow.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">Auto Routing</span><span class="model-opt-badge model-opt-badge--configured">/auto</span></div><span class="model-opt-id">Resume model-router for the next turn</span>`;
+  autoRow.onclick=()=>{ void _resumeModelRouterAutoFromUi(); };
+
+  container.appendChild(heading);
+  container.appendChild(note);
+  container.appendChild(autoRow);
+
+  for(const tier of tiers){
+    const active=!!(sessionState&&sessionState.pinned&&Number(sessionState.selected_tier)===Number(tier.tier));
+    const row=document.createElement('div');
+    row.className='model-opt model-router-opt'+(active?' active':'');
+    const badge=active
+      ? '<span class="model-opt-badge model-opt-badge--primary">Pinned</span>'
+      : `<span class="model-opt-badge model-opt-badge--configured">/${esc(String(tier.short_label||('T'+tier.tier)).toLowerCase())}</span>`;
+    const titleParts=[tier.model||''];
+    if(tier.reasoning) titleParts.push(`reasoning: ${tier.reasoning}`);
+    if(tier.role) titleParts.push(tier.role);
+    row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(`${tier.emoji?`${tier.emoji} `:''}${tier.label||('T'+tier.tier)}`)}</span>${badge}</div><span class="model-opt-id">${esc(titleParts.filter(Boolean).join(' | '))}</span>`;
+    row.onclick=()=>{ void _applyModelRouterTierFromUi(tier.tier); };
+    container.appendChild(row);
+  }
+}
+
+if(typeof window!=='undefined'){
+  window._modelRouterRefreshUiState=()=>_loadModelRouterUiState(true);
+  window._modelRouterApplyTier=(tierNum)=>_applyModelRouterTierFromUi(tierNum);
+  window._modelRouterResumeAuto=()=>_resumeModelRouterAutoFromUi();
+}
+
+"""
+WEBUI_UI_SYNC_MODEL_CHIP_OLD = """function syncModelChip(){
+  const sel=$('modelSelect');
+  const chip=$('composerModelChip');
+  const label=$('composerModelLabel');
+  const mobileLabel=$('composerMobileModelLabel');
+  const mobileAction=$('composerMobileModelAction');
+  const dd=$('composerModelDropdown');
+  if(!sel||!chip||!label) return;
+  // Don't show a model label until boot has finished loading to prevent flash of wrong default
+  if(!S._bootReady){
+    label.textContent='';
+    if(mobileLabel) mobileLabel.textContent='';
+    chip.title='Conversation model';
+    return;
+  }
+  const opt=_selectedModelOption();
+  const text=opt?opt.textContent:getModelLabel(sel.value||'');
+  const gatewayRouting=_latestGatewayRoutingForSession(S.session);
+  const displayText=_formatGatewayModelLabel(sel.value||'',text,gatewayRouting)||text;
+  label.textContent=displayText;
+  if(mobileLabel) mobileLabel.textContent=displayText;
+  chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');
+  chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
+  if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
+}
+"""
+WEBUI_UI_SYNC_MODEL_CHIP_NEW = """function syncModelChip(){
+  const sel=$('modelSelect');
+  const chip=$('composerModelChip');
+  const label=$('composerModelLabel');
+  const mobileLabel=$('composerMobileModelLabel');
+  const mobileAction=$('composerMobileModelAction');
+  const dd=$('composerModelDropdown');
+  if(!sel||!chip||!label) return;
+  // Don't show a model label until boot has finished loading to prevent flash of wrong default
+  if(!S._bootReady){
+    label.textContent='';
+    if(mobileLabel) mobileLabel.textContent='';
+    chip.title='Conversation model';
+    return;
+  }
+  const opt=_selectedModelOption();
+  const text=opt?opt.textContent:getModelLabel(sel.value||'');
+  const gatewayRouting=_latestGatewayRoutingForSession(S.session);
+  const routerLabel=_formatModelRouterChipLabel(sel.value||'',text,gatewayRouting);
+  const displayText=routerLabel||_formatGatewayModelLabel(sel.value||'',text,gatewayRouting)||text;
+  label.textContent=displayText;
+  if(mobileLabel) mobileLabel.textContent=displayText;
+  const routerTitle=_modelRouterChipTitle(sel.value||'',gatewayRouting);
+  chip.title=routerTitle||(gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model'));
+  chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
+  if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
+}
+"""
+WEBUI_UI_ROUTER_INSERT_OLD = """    dd.appendChild(_custRow);
+"""
+WEBUI_UI_ROUTER_INSERT_NEW = """    dd.appendChild(_custRow);
+    _appendModelRouterActions(dd);
+"""
+WEBUI_STYLE_ROUTER_BLOCK = """
+.model-router-note{padding:8px 14px 2px;font-size:11px;color:var(--muted);line-height:1.4;}
+.model-router-opt{border-bottom:1px solid var(--border2);}
+.model-router-actions{display:flex;flex-wrap:wrap;gap:8px;padding:8px 14px 12px;border-bottom:1px solid var(--border2);}
+.model-router-action{appearance:none;border:1px solid var(--border2);background:var(--surface);color:var(--text);border-radius:999px;padding:6px 12px;font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:background .12s,border-color .12s,color .12s,transform .12s;}
+.model-router-action:hover{background:var(--hover-bg);border-color:var(--accent-bg-strong);color:var(--accent-text);transform:translateY(-1px);}
+"""
+WEBUI_ROUTES_MODEL_ROUTER_HELPERS_BLOCK = """def _model_router_default_config() -> dict:
+    return {
+        "tiers": {
+            1: {
+                "label": "T1 Flash",
+                "emoji": "⚡",
+                "model": "qwen/qwen3.5-flash-02-23",
+                "reasoning": None,
+                "role": "fast acknowledgements and lightweight tasks",
+                "best_for": [],
+            },
+            2: {
+                "label": "T2 DeepSeek",
+                "emoji": "🔹",
+                "model": "deepseek/deepseek-v4-flash",
+                "reasoning": None,
+                "role": "default daily-driver",
+                "best_for": [],
+            },
+            3: {
+                "label": "T3 MiniMax",
+                "emoji": "🔷",
+                "model": "minimax/minimax-m2.7",
+                "reasoning": None,
+                "role": "strong reasoning and synthesis",
+                "best_for": [],
+            },
+            4: {
+                "label": "T4 DeepSeek Pro",
+                "emoji": "🔸",
+                "model": "deepseek/deepseek-v4-pro",
+                "reasoning": "high",
+                "role": "deliberate fast planner",
+                "best_for": [],
+            },
+            5: {
+                "label": "T5 Sonnet",
+                "emoji": "🔶",
+                "model": "anthropic/claude-sonnet-4.6",
+                "reasoning": "medium",
+                "role": "expensive deep-think mode",
+                "best_for": [],
+            },
+        }
+    }
+
+
+def _model_router_deep_merge(base: dict, override: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _model_router_deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _model_router_profile_home_for_session(session=None) -> Path:
+    try:
+        if session is not None and getattr(session, "profile", None):
+            from api.profiles import get_hermes_home_for_profile
+
+            return Path(get_hermes_home_for_profile(getattr(session, "profile", None))).expanduser()
+    except Exception:
+        pass
+    try:
+        from api.profiles import get_active_hermes_home
+
+        return Path(get_active_hermes_home()).expanduser()
+    except Exception:
+        return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+
+
+def _load_model_router_config_for_home(profile_home: Path) -> dict:
+    defaults = _model_router_default_config()
+    cfg_path = profile_home / "model_router.yaml"
+    if not cfg_path.exists():
+        return defaults
+    try:
+        import yaml
+
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, dict):
+            return defaults
+        merged = _model_router_deep_merge(defaults, raw)
+        tiers = {}
+        raw_tiers = merged.get("tiers", {})
+        for tier_num in range(1, 6):
+            tier_defaults = copy.deepcopy(defaults["tiers"][tier_num])
+            override = raw_tiers.get(tier_num, raw_tiers.get(str(tier_num), {}))
+            if not isinstance(override, dict):
+                override = {}
+            tier_defaults.update(override)
+            tiers[tier_num] = tier_defaults
+        merged["tiers"] = tiers
+        return merged
+    except Exception:
+        return defaults
+
+
+def _is_model_router_enabled_for_home(profile_home: Path) -> bool:
+    cfg_path = profile_home / "config.yaml"
+    if not cfg_path.exists():
+        return False
+    try:
+        import yaml
+
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        plugins = raw.get("plugins", {}) if isinstance(raw, dict) else {}
+        enabled = plugins.get("enabled", []) if isinstance(plugins, dict) else []
+        return "model-router" in enabled
+    except Exception:
+        return False
+
+
+def _get_model_router_manager():
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        manager.discover_and_load(force=False)
+        if not all(hasattr(manager, name) for name in ("router_pin_session", "router_unpin_session", "router_is_pinned")):
+            return None
+        return manager
+    except Exception:
+        return None
+
+
+def _model_router_tier_entries(config: dict) -> list[dict]:
+    tiers = []
+    raw_tiers = config.get("tiers", {})
+    for tier_num in range(1, 6):
+        meta = raw_tiers.get(tier_num, {})
+        tiers.append(
+            {
+                "tier": tier_num,
+                "short_label": f"T{tier_num}",
+                "label": str(meta.get("label", f"T{tier_num}") or f"T{tier_num}"),
+                "emoji": str(meta.get("emoji", "") or ""),
+                "model": str(meta.get("model", "") or ""),
+                "reasoning": meta.get("reasoning"),
+                "role": str(meta.get("role", "") or ""),
+                "best_for": [str(item) for item in (meta.get("best_for") or []) if str(item).strip()],
+            }
+        )
+    return tiers
+
+
+def _model_router_tier_for_model(model: str, tiers: list[dict]) -> int:
+    target = str(model or "").strip().lower()
+    if not target:
+        return 0
+    for tier in tiers:
+        if str(tier.get("model", "") or "").strip().lower() == target:
+            return int(tier.get("tier", 0) or 0)
+    return 0
+
+
+def _model_router_state_payload(session=None) -> dict:
+    profile_home = _model_router_profile_home_for_session(session)
+    config = _load_model_router_config_for_home(profile_home)
+    tiers = _model_router_tier_entries(config)
+    manager = _get_model_router_manager()
+    enabled = _is_model_router_enabled_for_home(profile_home) and manager is not None
+
+    session_payload = None
+    if session is not None:
+        sid = str(getattr(session, "session_id", "") or "")
+        model = str(getattr(session, "model", "") or "")
+        pinned = False
+        if enabled:
+            try:
+                pinned = bool(manager.router_is_pinned(sid))
+            except Exception:
+                pinned = False
+        selected_tier = _model_router_tier_for_model(model, tiers) if pinned else 0
+        active_tier = next((tier for tier in tiers if int(tier.get("tier", 0) or 0) == selected_tier), None)
+        session_payload = {
+            "session_id": sid,
+            "model": model,
+            "pinned": pinned,
+            "auto_routing": not pinned,
+            "selected_tier": selected_tier or None,
+            "active_tier": active_tier,
+        }
+
+    return {
+        "enabled": enabled,
+        "profile_home": str(profile_home),
+        "tiers": tiers,
+        "session": session_payload,
+    }
+
+
+def _handle_model_router_session_update(handler, body):
+    try:
+        require(body, "session_id")
+        require(body, "action")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+
+    sid = str(body.get("session_id", "") or "")
+    action = str(body.get("action", "") or "").strip().lower()
+    try:
+        session = get_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+
+    profile_home = _model_router_profile_home_for_session(session)
+    manager = _get_model_router_manager()
+    if not (_is_model_router_enabled_for_home(profile_home) and manager is not None):
+        return bad(handler, "model-router is not enabled for this profile", 404)
+
+    if action == "auto":
+        try:
+            manager.router_unpin_session(sid)
+        except Exception as exc:
+            return bad(handler, f"Failed to resume auto-routing: {exc}", 500)
+        payload = _model_router_state_payload(session)
+        return j(handler, {"ok": True, "router": payload, "session": session.compact() | {"messages": session.messages}})
+
+    if action != "pin":
+        return bad(handler, "Unsupported model-router action", 400)
+
+    try:
+        tier_num = int(body.get("tier", 0) or 0)
+    except Exception:
+        return bad(handler, "tier must be an integer", 400)
+    if tier_num not in (1, 2, 3, 4, 5):
+        return bad(handler, "tier must be 1-5", 400)
+
+    config = _load_model_router_config_for_home(profile_home)
+    tier_meta = config.get("tiers", {}).get(tier_num, {})
+    target_model = str(tier_meta.get("model", "") or "").strip()
+    if not target_model:
+        return bad(handler, f"T{tier_num} is not configured", 400)
+
+    with _get_session_agent_lock(sid):
+        session.model = target_model
+        session.save()
+    try:
+        manager.router_pin_session(sid, target_model)
+    except Exception as exc:
+        return bad(handler, f"Failed to pin model-router session: {exc}", 500)
+
+    payload = _model_router_state_payload(session)
+    return j(handler, {"ok": True, "router": payload, "session": session.compact() | {"messages": session.messages}})
+
+
+"""
+WEBUI_ROUTES_MODEL_ROUTER_GET_OLD = """    if parsed.path == "/api/commands":
+"""
+WEBUI_ROUTES_MODEL_ROUTER_GET_NEW = """    if parsed.path == "/api/model-router":
+        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        session = None
+        if sid:
+            try:
+                session = get_session(sid)
+            except KeyError:
+                return bad(handler, "Session not found", 404)
+        return j(handler, _model_router_state_payload(session))
+
+    if parsed.path == "/api/commands":
+"""
+WEBUI_ROUTES_MODEL_ROUTER_POST_OLD = """    if parsed.path == "/api/session/update":
+"""
+WEBUI_ROUTES_MODEL_ROUTER_POST_NEW = """    if parsed.path == "/api/model-router/session":
+        return _handle_model_router_session_update(handler, body)
+
+    if parsed.path == "/api/session/update":
+"""
+WEBUI_ROUTES_MODEL_ROUTER_CHAT_HELPERS_BLOCK = """
+def _prepare_model_router_chat_start(session, msg: str, model: str, model_provider):
+    profile_home = _model_router_profile_home_for_session(session)
+    manager = _get_model_router_manager()
+    if not (_is_model_router_enabled_for_home(profile_home) and manager is not None):
+        return model, model_provider
+
+    prepare_turn = getattr(manager, "router_prepare_turn", None)
+    if not callable(prepare_turn):
+        return model, model_provider
+
+    try:
+        route = prepare_turn(
+            session_id=str(getattr(session, "session_id", "") or ""),
+            user_message=str(msg or ""),
+            conversation_history=list(getattr(session, "messages", []) or []),
+            current_model=str(model or getattr(session, "model", "") or ""),
+            platform="webui",
+            apply_live=False,
+        ) or {}
+    except Exception as exc:
+        logger.debug("model-router turn preparation failed for webui: %s", exc)
+        return model, model_provider
+
+    routed_model = str(route.get("model", "") or "").strip()
+    if routed_model:
+        return routed_model, model_provider
+    return model, model_provider
+
+
+"""
+WEBUI_ROUTES_MODEL_ROUTER_CHAT_PREPARE_OLD = """    if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+        goal_related = True
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
+    stream_id = uuid.uuid4().hex
+"""
+WEBUI_ROUTES_MODEL_ROUTER_CHAT_PREPARE_NEW = """    if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+        goal_related = True
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
+    model, model_provider = _prepare_model_router_chat_start(s, msg, model, model_provider)
+
+    stream_id = uuid.uuid4().hex
+"""
+WEBUI_ROUTES_MODEL_ROUTER_RESPONSE_OLD = """    if normalized_model:
+        response["effective_model"] = model
+"""
+WEBUI_ROUTES_MODEL_ROUTER_RESPONSE_NEW = """    if normalized_model:
+        response["effective_model"] = model
+    response["router_turn_model"] = model
+"""
+WEBUI_STREAMING_ROUTER_BIND_INIT_OLD = """    agent = None
+    _live_prompt_estimate_tokens = [0]
+"""
+WEBUI_STREAMING_ROUTER_BIND_INIT_NEW = """    agent = None
+    _router_agent_bound = False
+    _live_prompt_estimate_tokens = [0]
+"""
+WEBUI_STREAMING_ROUTER_BIND_OLD = """            # Prepend workspace context so the agent always knows which directory
+"""
+WEBUI_STREAMING_ROUTER_BIND_NEW = """            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _pm = _get_plugin_manager()
+                _bind_router_agent = getattr(_pm, "router_bind_agent", None)
+                if callable(_bind_router_agent):
+                    _bind_router_agent(session_id, agent)
+                    _router_agent_bound = True
+            except Exception:
+                logger.debug("[webui] model-router live-agent bind failed", exc_info=True)
+
+            # Prepend workspace context so the agent always knows which directory
+"""
+WEBUI_STREAMING_ROUTER_UNBIND_OLD = """            if _clarify_registered and _unreg_clarify_notify is not None:
+                try:
+                    _unreg_clarify_notify(session_id)
+                except Exception:
+                    logger.debug("Failed to unregister clarify callback")
+            with _ENV_LOCK:
+"""
+WEBUI_STREAMING_ROUTER_UNBIND_NEW = """            if _clarify_registered and _unreg_clarify_notify is not None:
+                try:
+                    _unreg_clarify_notify(session_id)
+                except Exception:
+                    logger.debug("Failed to unregister clarify callback")
+            if _router_agent_bound:
+                try:
+                    from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                    _pm = _get_plugin_manager()
+                    _unbind_router_agent = getattr(_pm, "router_unbind_agent", None)
+                    if callable(_unbind_router_agent):
+                        _unbind_router_agent(session_id, agent)
+                except Exception:
+                    logger.debug("[webui] model-router live-agent unbind failed", exc_info=True)
+            with _ENV_LOCK:
+"""
+WEBUI_UI_SET_BUSY_OLD = """function setBusy(v){
+  S.busy=v;
+  updateSendBtn();
+  if(!v){
+    if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
+    setStatus('');
+    setComposerStatus('');
+    const sid=_queueDrainSid||(S.session&&S.session.session_id);
+    _queueDrainSid=null;
+    updateQueueBadge(sid);
+    // Drain one queued message for the finished session after UI settles
+    const _isViewedSid=!S.session||sid===S.session.session_id;
+    const next=sid&&_isViewedSid?shiftQueuedSessionMessage(sid):null;
+    if(next){
+      updateQueueBadge(sid);
+      setTimeout(()=>{
+        $('msg').value=next.text||'';
+        S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
+        // Restore model from queued item (sent in /api/chat/start payload)
+        // Note: profile is NOT restored — full profile switch requires server interaction
+        if(next.model&&S.session&&next.model!==S.session.model){
+          S.session.model=next.model;
+        }
+        if(next.model_provider&&S.session) S.session.model_provider=next.model_provider;
+        if(next.model&&S.session){
+          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
+          if(typeof syncModelChip==='function') syncModelChip();
+        }
+        autoResize();
+        renderTray();
+        send();
+      },120);
+    }
+  }
+}
+"""
+WEBUI_UI_SET_BUSY_NEW = """function setBusy(v){
+  S.busy=v;
+  updateSendBtn();
+  if(!v){
+    if(S.session) S.session.model_router_turn_model=null;
+    if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
+    setStatus('');
+    setComposerStatus('');
+    const sid=_queueDrainSid||(S.session&&S.session.session_id);
+    _queueDrainSid=null;
+    updateQueueBadge(sid);
+    // Drain one queued message for the finished session after UI settles
+    const _isViewedSid=!S.session||sid===S.session.session_id;
+    const next=sid&&_isViewedSid?shiftQueuedSessionMessage(sid):null;
+    if(next){
+      updateQueueBadge(sid);
+      setTimeout(()=>{
+        $('msg').value=next.text||'';
+        S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
+        // Restore model from queued item (sent in /api/chat/start payload)
+        // Note: profile is NOT restored — full profile switch requires server interaction
+        if(next.model&&S.session&&next.model!==S.session.model){
+          S.session.model=next.model;
+        }
+        if(next.model_provider&&S.session) S.session.model_provider=next.model_provider;
+        if(next.model&&S.session){
+          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
+          if(typeof syncModelChip==='function') syncModelChip();
+        }
+        autoResize();
+        renderTray();
+        send();
+      },120);
+    }
+  }
+  if(typeof syncModelChip==='function') syncModelChip();
+}
+"""
+WEBUI_MESSAGES_ROUTER_SYNC_OLD = """    if(S.session&&S.session.session_id===activeSid){
+      S.session.active_stream_id = streamId;
+    }
+"""
+WEBUI_MESSAGES_ROUTER_SYNC_NEW = """    if(S.session&&S.session.session_id===activeSid){
+      S.session.active_stream_id = streamId;
+    }
+    if(typeof syncModelChip==='function') syncModelChip();
+"""
+WEBUI_MESSAGES_EFFECTIVE_MODEL_OLD = """    if(startData.effective_model && S.session){
+      S.session.model=startData.effective_model;
+      S.session.model_provider=startData.effective_model_provider||S.session.model_provider||null;
+      localStorage.setItem('hermes-webui-model', startData.effective_model);
+      if(typeof _writePersistedModelState==='function') _writePersistedModelState(startData.effective_model,S.session.model_provider||null);
+      if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'),S.session.model_provider||null);
+      if(typeof syncTopbar==='function') syncTopbar();
+"""
+WEBUI_MESSAGES_EFFECTIVE_MODEL_NEW = """    if(startData.effective_model && S.session){
+      S.session.model=startData.effective_model;
+      S.session.model_provider=startData.effective_model_provider||S.session.model_provider||null;
+      localStorage.setItem('hermes-webui-model', startData.effective_model);
+      if(typeof _writePersistedModelState==='function') _writePersistedModelState(startData.effective_model,S.session.model_provider||null);
+      if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'),S.session.model_provider||null);
+      if(typeof syncModelChip==='function') syncModelChip();
+      if(typeof syncTopbar==='function') syncTopbar();
+"""
+WEBUI_MESSAGES_ROUTER_TURN_MODEL_OLD = """    streamId=startData.stream_id;
+"""
+WEBUI_MESSAGES_ROUTER_TURN_MODEL_NEW = """    if(startData.router_turn_model && S.session){
+      S.session.model_router_turn_model=startData.router_turn_model;
+      if(typeof syncModelChip==='function') syncModelChip();
+    }
+    streamId=startData.stream_id;
+"""
+WEBUI_MESSAGES_GATEWAY_ROUTING_OLD = """            if(d.usage.gateway_routing){
+              lastAsst._gatewayRouting=d.usage.gateway_routing;
+              if(S.session)S.session.gateway_routing=d.usage.gateway_routing;
+              if(S.session&&Array.isArray(S.session.gateway_routing_history))S.session.gateway_routing_history.push(d.usage.gateway_routing);
+              else if(S.session)S.session.gateway_routing_history=[d.usage.gateway_routing];
+            }
+"""
+WEBUI_MESSAGES_GATEWAY_ROUTING_NEW = """            if(d.usage.gateway_routing){
+              lastAsst._gatewayRouting=d.usage.gateway_routing;
+              if(S.session)S.session.gateway_routing=d.usage.gateway_routing;
+              if(S.session&&Array.isArray(S.session.gateway_routing_history))S.session.gateway_routing_history.push(d.usage.gateway_routing);
+              else if(S.session)S.session.gateway_routing_history=[d.usage.gateway_routing];
+              if(typeof syncModelChip==='function') syncModelChip();
+            }
+"""
+
 LAUNCHER_TEMPLATE = """#!/usr/bin/env bash
 unset PYTHONPATH
 unset PYTHONHOME
@@ -457,6 +1415,352 @@ def repair_cli_py(cli_path: Path) -> bool:
     if text == original:
         return False
     return _write_with_backup_if_changed(cli_path, text)
+
+
+def _is_hermes_webui_root(path: Path) -> bool:
+    return path.is_dir() and all((path / rel).exists() for rel in WEBUI_REQUIRED_FILES)
+
+
+def _configured_webui_roots(targets: list[tuple[str, Path]]) -> list[Path]:
+    roots: list[Path] = []
+    for _, home_dir in targets:
+        cfg_path = router_config_path(home_dir)
+        if not cfg_path.exists():
+            continue
+        try:
+            raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        integrations = raw.get("integrations", {})
+        if not isinstance(integrations, dict):
+            continue
+        custom = str(integrations.get("hermes_webui_dir", "") or "").strip()
+        if custom:
+            roots.append(Path(custom).expanduser())
+    return roots
+
+
+def _candidate_webui_roots(home_root: Path, targets: list[tuple[str, Path]] | None = None) -> list[Path]:
+    home = Path.home()
+    plugin_root = plugin_source_dir().resolve()
+    candidates: list[Path] = []
+    for configured in _configured_webui_roots(targets or []):
+        candidates.append(configured)
+    for env_name in WEBUI_ENV_VARS:
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            candidates.append(Path(raw).expanduser())
+    if candidates:
+        return candidates
+    candidates.extend([
+        home_root / "hermes-webui",
+        home_root / "webui",
+        plugin_root.parent.parent / "hermes-webui",
+        home / "hermes-webui",
+        home / "GitHub" / "hermes-webui",
+        home / "code" / "hermes-webui",
+        home / "src" / "hermes-webui",
+        home / "projects" / "hermes-webui",
+    ])
+    return candidates
+
+
+def discover_hermes_webui_roots(home_root: Path, targets: list[tuple[str, Path]] | None = None) -> list[Path]:
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in _candidate_webui_roots(home_root, targets):
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if _is_hermes_webui_root(resolved):
+            roots.append(resolved)
+        elif targets:
+            for _, home_dir in targets:
+                cfg_path = router_config_path(home_dir)
+                if not cfg_path.exists():
+                    continue
+                try:
+                    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    continue
+                integrations = raw.get("integrations", {}) if isinstance(raw, dict) else {}
+                configured = str(integrations.get("hermes_webui_dir", "") or "").strip() if isinstance(integrations, dict) else ""
+                if configured and Path(configured).expanduser().resolve(strict=False) == resolved:
+                    warn(f"Configured hermes-webui path does not look valid: {candidate}")
+                    break
+    return roots
+
+
+def _replace_required_snippet(text: str, old: str, new: str, missing_error: str) -> str:
+    if new in text:
+        return text
+    if old not in text:
+        fail(missing_error)
+    return text.replace(old, new, 1)
+
+
+def repair_webui_commands_js(commands_path: Path) -> bool:
+    if not commands_path.exists():
+        return False
+    text = commands_path.read_text(encoding="utf-8")
+    original = text
+
+    if WEBUI_COMMANDS_ROUTER_HELPERS_BLOCK not in text:
+        anchor = "async function getSlashAutocompleteMatches(text){"
+        if anchor not in text:
+            fail("Could not locate getSlashAutocompleteMatches() in hermes-webui static/commands.js")
+        text = text.replace(anchor, WEBUI_COMMANDS_ROUTER_HELPERS_BLOCK + anchor, 1)
+
+    text = _replace_required_snippet(
+        text,
+        WEBUI_COMMANDS_ROUTER_MATCH_BLOCK_OLD,
+        WEBUI_COMMANDS_ROUTER_MATCH_BLOCK_NEW,
+        "Could not locate command autocomplete branch in hermes-webui static/commands.js",
+    )
+
+    if "name:'auto'" not in text or "name:'t1'" not in text:
+        text = _replace_required_snippet(
+            text,
+            WEBUI_COMMANDS_ROUTER_COMMANDS_OLD,
+            WEBUI_COMMANDS_ROUTER_COMMANDS_NEW,
+            "Could not locate /model command entry in hermes-webui static/commands.js",
+        )
+
+    if WEBUI_COMMANDS_ROUTER_HELPERS_BLOCK_V2 not in text:
+        anchor = "async function cmdModel(args){"
+        if anchor not in text:
+            fail("Could not locate cmdModel() in hermes-webui static/commands.js")
+        text = text.replace(anchor, WEBUI_COMMANDS_ROUTER_HELPERS_BLOCK_V2 + anchor, 1)
+
+    if text == original:
+        return False
+    return _write_with_backup_if_changed(commands_path, text)
+
+
+def repair_webui_routes_py(routes_path: Path) -> bool:
+    if not routes_path.exists():
+        return False
+    text = routes_path.read_text(encoding="utf-8")
+    original = text
+
+    text = text.replace('"model": "qwen/qwen3.6-plus",', '"model": "qwen/qwen3.5-flash-02-23",')
+
+    if WEBUI_ROUTES_MODEL_ROUTER_HELPERS_BLOCK not in text:
+        anchor = "def _get_plugin_manager_for_visibility():"
+        if anchor not in text:
+            fail("Could not locate plugin visibility helpers in hermes-webui api/routes.py")
+        text = text.replace(anchor, WEBUI_ROUTES_MODEL_ROUTER_HELPERS_BLOCK + anchor, 1)
+
+    if WEBUI_ROUTES_MODEL_ROUTER_CHAT_HELPERS_BLOCK not in text:
+        anchor = "def _handle_model_router_session_update(handler, body):"
+        if anchor not in text:
+            fail("Could not locate model-router session helper in hermes-webui api/routes.py")
+        text = text.replace(anchor, WEBUI_ROUTES_MODEL_ROUTER_CHAT_HELPERS_BLOCK + anchor, 1)
+
+    text = re.sub(
+        r"^\s*model, model_provider = _prepare_model_router_chat_start\(s, msg, model, model_provider\)\n",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = _replace_required_snippet(
+        text,
+        WEBUI_ROUTES_MODEL_ROUTER_GET_OLD,
+        WEBUI_ROUTES_MODEL_ROUTER_GET_NEW,
+        "Could not locate /api/commands route in hermes-webui api/routes.py",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_ROUTES_MODEL_ROUTER_POST_OLD,
+        WEBUI_ROUTES_MODEL_ROUTER_POST_NEW,
+        "Could not locate /api/session/update route in hermes-webui api/routes.py",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_ROUTES_MODEL_ROUTER_CHAT_PREPARE_OLD,
+        WEBUI_ROUTES_MODEL_ROUTER_CHAT_PREPARE_NEW,
+        "Could not locate goal-continuation block in hermes-webui api/routes.py",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_ROUTES_MODEL_ROUTER_RESPONSE_OLD,
+        WEBUI_ROUTES_MODEL_ROUTER_RESPONSE_NEW,
+        "Could not locate effective_model response block in hermes-webui api/routes.py",
+    )
+
+    if text == original:
+        return False
+    return _write_with_backup_if_changed(routes_path, text)
+
+
+def repair_webui_streaming_py(streaming_path: Path) -> bool:
+    if not streaming_path.exists():
+        return False
+    text = streaming_path.read_text(encoding="utf-8")
+    original = text
+
+    text = _replace_required_snippet(
+        text,
+        WEBUI_STREAMING_ROUTER_BIND_INIT_OLD,
+        WEBUI_STREAMING_ROUTER_BIND_INIT_NEW,
+        "Could not locate agent initialization in hermes-webui api/streaming.py",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_STREAMING_ROUTER_BIND_OLD,
+        WEBUI_STREAMING_ROUTER_BIND_NEW,
+        "Could not locate workspace-context setup in hermes-webui api/streaming.py",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_STREAMING_ROUTER_UNBIND_OLD,
+        WEBUI_STREAMING_ROUTER_UNBIND_NEW,
+        "Could not locate clarify cleanup block in hermes-webui api/streaming.py",
+    )
+
+    if text == original:
+        return False
+    return _write_with_backup_if_changed(streaming_path, text)
+
+
+def repair_webui_ui_js(ui_path: Path) -> bool:
+    if not ui_path.exists():
+        return False
+    text = ui_path.read_text(encoding="utf-8")
+    original = text
+
+    text = re.sub(
+        r"function _modelRouterUiSessionId\(\)\{[\s\S]*?window\._modelRouterResumeAuto=\(\)=>_resumeModelRouterAutoFromUi\(\);\n\}\n+",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+    if WEBUI_UI_ROUTER_HELPERS_BLOCK_LEGACY in text:
+        text = text.replace(WEBUI_UI_ROUTER_HELPERS_BLOCK_LEGACY, "", 1)
+    anchor = "function renderModelDropdown(){"
+    if anchor not in text:
+        fail("Could not locate renderModelDropdown() in hermes-webui static/ui.js")
+    if WEBUI_UI_ROUTER_HELPERS_BLOCK not in text:
+        text = text.replace(anchor, WEBUI_UI_ROUTER_HELPERS_BLOCK + anchor, 1)
+
+    if WEBUI_UI_ROUTER_INSERT_NEW not in text:
+        if WEBUI_UI_ROUTER_INSERT_OLD not in text:
+            fail("Could not locate model dropdown custom-row insertion in hermes-webui static/ui.js")
+        text = text.replace(WEBUI_UI_ROUTER_INSERT_OLD, WEBUI_UI_ROUTER_INSERT_NEW, 1)
+
+    text = _replace_required_snippet(
+        text,
+        WEBUI_UI_SYNC_MODEL_CHIP_OLD,
+        WEBUI_UI_SYNC_MODEL_CHIP_NEW,
+        "Could not locate syncModelChip() in hermes-webui static/ui.js",
+    )
+    if WEBUI_UI_SET_BUSY_NEW not in text:
+        if WEBUI_UI_SET_BUSY_OLD in text:
+            text = text.replace(WEBUI_UI_SET_BUSY_OLD, WEBUI_UI_SET_BUSY_NEW, 1)
+        else:
+            set_busy_pattern = (
+                r"function setBusy\(v\)\{\n"
+                r"  S\.busy=v;\n"
+                r"  updateSendBtn\(\);\n"
+                r"  if\(!v\)\{\n"
+                r"(?P<body>[\s\S]*?)"
+                r"  \}\n"
+                r"  if\(typeof syncModelChip==='function'\) syncModelChip\(\);\n"
+                r"\}\n"
+            )
+            match = re.search(set_busy_pattern, text, flags=re.MULTILINE)
+            if not match:
+                fail("Could not locate setBusy() in hermes-webui static/ui.js")
+            body = match.group("body")
+            if "S.session.model_router_turn_model=null;" not in body:
+                body = "    if(S.session) S.session.model_router_turn_model=null;\n" + body
+            replacement = (
+                "function setBusy(v){\n"
+                "  S.busy=v;\n"
+                "  updateSendBtn();\n"
+                "  if(!v){\n"
+                f"{body}"
+                "  }\n"
+                "  if(typeof syncModelChip==='function') syncModelChip();\n"
+                "}\n"
+            )
+            text = text[:match.start()] + replacement + text[match.end():]
+
+    if text == original:
+        return False
+    return _write_with_backup_if_changed(ui_path, text)
+
+
+def repair_webui_messages_js(messages_path: Path) -> bool:
+    if not messages_path.exists():
+        return False
+    text = messages_path.read_text(encoding="utf-8")
+    original = text
+
+    text = _replace_required_snippet(
+        text,
+        WEBUI_MESSAGES_EFFECTIVE_MODEL_OLD,
+        WEBUI_MESSAGES_EFFECTIVE_MODEL_NEW,
+        "Could not locate effective_model handling in hermes-webui static/messages.js",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_MESSAGES_ROUTER_TURN_MODEL_OLD,
+        WEBUI_MESSAGES_ROUTER_TURN_MODEL_NEW,
+        "Could not locate stream_id handling in hermes-webui static/messages.js",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_MESSAGES_GATEWAY_ROUTING_OLD,
+        WEBUI_MESSAGES_GATEWAY_ROUTING_NEW,
+        "Could not locate gateway_routing handling in hermes-webui static/messages.js",
+    )
+    text = _replace_required_snippet(
+        text,
+        WEBUI_MESSAGES_ROUTER_SYNC_OLD,
+        WEBUI_MESSAGES_ROUTER_SYNC_NEW,
+        "Could not locate active_stream_id update in hermes-webui static/messages.js",
+    )
+
+    if text == original:
+        return False
+    return _write_with_backup_if_changed(messages_path, text)
+
+
+def repair_webui_style_css(style_path: Path) -> bool:
+    if not style_path.exists():
+        return False
+    text = style_path.read_text(encoding="utf-8")
+    if WEBUI_STYLE_ROUTER_BLOCK.strip() in text:
+        return False
+    new_text = text.rstrip() + "\n" + WEBUI_STYLE_ROUTER_BLOCK
+    return _write_with_backup_if_changed(style_path, new_text)
+
+
+def repair_hermes_webui(home_root: Path, targets: list[tuple[str, Path]] | None = None) -> None:
+    roots = discover_hermes_webui_roots(home_root, targets)
+    if not roots:
+        info("No hermes-webui checkout detected; skipping WebUI integration")
+        return
+
+    for root in roots:
+        info(f"Patching hermes-webui integration: {root}")
+        try:
+            changed = False
+            changed = repair_webui_routes_py(root / "api" / "routes.py") or changed
+            changed = repair_webui_streaming_py(root / "api" / "streaming.py") or changed
+            changed = repair_webui_commands_js(root / "static" / "commands.js") or changed
+            changed = repair_webui_messages_js(root / "static" / "messages.js") or changed
+            changed = repair_webui_ui_js(root / "static" / "ui.js") or changed
+            changed = repair_webui_style_css(root / "static" / "style.css") or changed
+            if not changed:
+                ok(f"hermes-webui integration already current: {root}")
+        except OSError as exc:
+            warn(f"hermes-webui patch skipped for {root}: {exc}")
 
 
 def repair_hermes_core(home_root: Path) -> None:
@@ -928,11 +2232,12 @@ def main(argv: list[str]) -> int:
         print(startup_status(home_root, profile_name))
         return 0
 
+    targets = discover_targets(home_root, argv)
     repair_hermes_core(home_root)
     compat_check(home_root)
     canonical_dir = sync_global_plugin(home_root)
     ensure_global_launcher(home_root)
-    targets = discover_targets(home_root, argv)
+    repair_hermes_webui(home_root, targets)
 
     if not targets:
         warn("No install targets found")
