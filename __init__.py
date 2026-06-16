@@ -861,7 +861,6 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
     """Switch agent.model + reasoning_config to target_tier. Emits badge.
 
     Uses _select_tier_entry to skip unhealthy primary providers.
-    Syncs tier-specific fallback_providers to config.yaml for hermes-native fallback.
     """
     global _manager_ref
 
@@ -870,10 +869,6 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
 
     target_model, target_reasoning, _ = _select_tier_entry(target_tier)
     current_tier = MODEL_TO_TIER.get(current_model, 2)
-
-    # Sync this tier's fallback chain to config.yaml so hermes handles
-    # provider failures during the actual LLM call automatically.
-    _sync_tier_fallbacks_to_config(target_tier)
 
     # Apply status bar patch lazily (needs cli ref)
     try:
@@ -1103,6 +1098,32 @@ def on_post_llm_call(
 
 
 # ---------------------------------------------------------------------------
+# Hook: pre_gateway_dispatch  (fires before every incoming message is dispatched)
+# ---------------------------------------------------------------------------
+
+def on_pre_gateway_dispatch(*, gateway=None, **kwargs: Any) -> None:
+    """Populate _live_agents from the gateway's running session pool.
+
+    In TUI/gateway mode _manager_ref._cli_ref is None, so _get_live_agent falls
+    back to _live_agents.  We refresh this cache on every dispatch so each
+    agent's session_id → agent mapping is current when pre_llm_call fires.
+    """
+    if gateway is None:
+        return
+    try:
+        running_agents = getattr(gateway, "_running_agents", {})
+        with _state_lock:
+            for agent in running_agents.values():
+                if agent is None:
+                    continue
+                sid = getattr(agent, "session_id", None) or ""
+                if sid and hasattr(agent, "model"):
+                    _live_agents[sid] = agent
+    except Exception as exc:
+        logger.debug("model-router: pre_gateway_dispatch agent sync failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Hook: api_request_error  (fires on every failed LLM API call in the loop)
 # ---------------------------------------------------------------------------
 
@@ -1136,10 +1157,11 @@ def register(ctx) -> None:
     global _manager_ref
     _load_router_config()
     _manager_ref = ctx._manager
-    ctx.register_hook("pre_llm_call",      on_pre_llm_call)
-    ctx.register_hook("post_llm_call",     on_post_llm_call)
-    ctx.register_hook("api_request_error", on_api_request_error)
-    ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("pre_llm_call",          on_pre_llm_call)
+    ctx.register_hook("post_llm_call",         on_post_llm_call)
+    ctx.register_hook("post_tool_call",        on_post_tool_call)
+    ctx.register_hook("api_request_error",     on_api_request_error)
+    ctx.register_hook("pre_gateway_dispatch",  on_pre_gateway_dispatch)
 
     # Expose public API on the PluginManager so slash commands (/t1-/t5, /auto)
     # can call us via get_plugin_manager().router_apply_tier(...).
