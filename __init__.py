@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_ROUTER_CONFIG = {
+    "provider_priority": ["nous", "openai-codex", "openrouter"],
     "classifier": {
         "provider": "openrouter",
         "model": "qwen/qwen3.5-flash-02-23",
@@ -47,6 +48,10 @@ DEFAULT_ROUTER_CONFIG = {
         "api_key": "",
         "timeout": 30,
         "extra_body": {"enable_caching": True},
+        "fallbacks": [
+            {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning_effort": "low"},
+            {"provider": "openrouter", "model": "qwen/qwen3.5-flash-02-23"},
+        ],
     },
     "tiers": {
         1: {
@@ -61,6 +66,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Status checks",
                 "Title generation",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "low"},
+                {"provider": "openrouter", "model": "qwen/qwen3.5-flash-02-23"},
+            ],
         },
         2: {
             "label": "T2 DeepSeek",
@@ -72,6 +81,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Default day-to-day work",
                 "Documentation and drafting",
                 "Standard coding and research",
+            ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "high"},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
             ],
         },
         3: {
@@ -86,6 +99,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Large-document synthesis",
                 "Complex analysis",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "xhigh"},
+                {"provider": "openrouter", "model": "minimax/minimax-m2.7"},
+            ],
         },
         4: {
             "label": "T4 DeepSeek Pro",
@@ -99,6 +116,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Complex multi-step design",
                 "Nuanced code review",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4", "reasoning": "medium"},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "high"},
+            ],
         },
         5: {
             "label": "T5 Sonnet",
@@ -111,6 +132,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Algorithmic optimization",
                 "High-stakes reasoning",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.5", "reasoning": "high"},
+                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4-6", "reasoning": "medium"},
+            ],
         },
     },
 }
@@ -121,6 +146,19 @@ MODEL_TO_TIER: dict[str, int] = {}
 FLASH_MODEL = ""
 FLASH_PROVIDER = ""
 _TIER_LABELS: dict[int, tuple[str, str]] = {}
+PROVIDER_PRIORITY: list[str] = []
+TIER_FALLBACKS: dict[int, list[dict[str, Any]]] = {}
+CLASSIFIER_FALLBACKS: list[dict[str, Any]] = []
+_provider_failures: dict[str, float] = {}
+_PROVIDER_UNHEALTHY_TTL = 120.0
+
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "nous": "https://inference-api.nousresearch.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "openai": "https://api.openai.com/v1",
+}
 
 
 def _get_hermes_home() -> Path:
@@ -156,6 +194,9 @@ def _normalize_router_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(override, dict):
             override = {}
         tier_defaults.update(override)
+        # Preserve fallbacks from user yaml if present; they may differ from defaults
+        if "fallbacks" in override:
+            tier_defaults["fallbacks"] = override["fallbacks"]
         normalized_tiers[tier_num] = tier_defaults
     merged["tiers"] = normalized_tiers
     return merged
@@ -163,6 +204,7 @@ def _normalize_router_config(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 def _apply_router_config(config: dict[str, Any]) -> None:
     global _router_config, TIERS, MODEL_TO_TIER, FLASH_MODEL, FLASH_PROVIDER, _TIER_LABELS
+    global PROVIDER_PRIORITY, TIER_FALLBACKS, CLASSIFIER_FALLBACKS
 
     _router_config = config
     TIERS = {
@@ -189,6 +231,13 @@ def _apply_router_config(config: dict[str, Any]) -> None:
 
     _TIER_LABELS = {
         tier_num: (meta.get("emoji", ""), meta.get("label", f"T{tier_num}"))
+        for tier_num, meta in config["tiers"].items()
+    }
+
+    PROVIDER_PRIORITY = config.get("provider_priority", list(DEFAULT_ROUTER_CONFIG.get("provider_priority", [])))
+    CLASSIFIER_FALLBACKS = classifier.get("fallbacks", list(DEFAULT_ROUTER_CONFIG["classifier"].get("fallbacks", [])))
+    TIER_FALLBACKS = {
+        tier_num: list(meta.get("fallbacks", []))
         for tier_num, meta in config["tiers"].items()
     }
 
@@ -315,47 +364,100 @@ Respond with ONLY a single digit: 1, 2, 3, 4, or 5. Nothing else."""
 
 
 def _classify_with_flash(user_message: str, conversation_history: list) -> int:
-    """Call Flash to classify turn complexity. Returns tier 1-5."""
+    """Call Flash to classify turn complexity. Returns tier 1-5.
+
+    Attempts the configured primary classifier first (via triage_specifier task),
+    then retries each entry in classifier.fallbacks if the primary fails.
+    """
     try:
         from agent.auxiliary_client import call_llm
-
-        # Include last 2 assistant turns as context (cheap, small)
-        context_turns = []
-        assistant_count = 0
-        for msg in reversed(conversation_history):
-            if isinstance(msg, dict) and msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    context_turns.insert(0, {"role": "assistant", "content": content[:300]})
-                    assistant_count += 1
-                    if assistant_count >= 2:
-                        break
-
-        messages = [{"role": "system", "content": _CLASSIFIER_SYSTEM}]
-        if context_turns:
-            messages.append({
-                "role": "user",
-                "content": "[Recent conversation context]\n"
-                           + "\n".join(f"Assistant: {m['content']}" for m in context_turns),
-            })
-            messages.append({"role": "assistant", "content": "Understood."})
-
-        messages.append({"role": "user", "content": user_message[:800]})
-
-        response = call_llm(
-            task="triage_specifier",
-            messages=messages,
-            max_tokens=3,
-            temperature=0.0,
-        )
-        raw = response.choices[0].message.content.strip()
-        digit = re.search(r"[1-5]", raw)
-        if digit:
-            return int(digit.group())
-        return 2
     except Exception as exc:
-        logger.warning("model-router: Flash classification failed: %s -- defaulting T2", exc)
+        logger.warning("model-router: auxiliary_client unavailable: %s -- defaulting T2", exc)
         return 2
+
+    # Include last 2 assistant turns as context (cheap, small)
+    context_turns = []
+    assistant_count = 0
+    for msg in reversed(conversation_history):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                context_turns.insert(0, {"role": "assistant", "content": content[:300]})
+                assistant_count += 1
+                if assistant_count >= 2:
+                    break
+
+    messages = [{"role": "system", "content": _CLASSIFIER_SYSTEM}]
+    if context_turns:
+        messages.append({
+            "role": "user",
+            "content": "[Recent conversation context]\n"
+                       + "\n".join(f"Assistant: {m['content']}" for m in context_turns),
+        })
+        messages.append({"role": "assistant", "content": "Understood."})
+    messages.append({"role": "user", "content": user_message[:800]})
+
+    def _parse_tier(response: Any) -> int | None:
+        try:
+            raw = response.choices[0].message.content.strip()
+            digit = re.search(r"[1-5]", raw)
+            return int(digit.group()) if digit else None
+        except Exception:
+            return None
+
+    # --- Primary attempt (uses triage_specifier task config from config.yaml) ---
+    primary_provider = FLASH_PROVIDER or (PROVIDER_PRIORITY[0] if PROVIDER_PRIORITY else "")
+    if _is_provider_healthy(primary_provider):
+        try:
+            response = call_llm(
+                task="triage_specifier",
+                messages=messages,
+                max_tokens=3,
+                temperature=0.0,
+            )
+            tier = _parse_tier(response)
+            if tier is not None:
+                return tier
+        except Exception as exc:
+            logger.warning("model-router: classifier primary (%s) failed: %s", primary_provider, exc)
+            _mark_provider_failed(primary_provider)
+    else:
+        logger.info("model-router: classifier primary provider %r unhealthy; skipping to fallbacks", primary_provider)
+
+    # --- Fallback attempts ---
+    for fb in CLASSIFIER_FALLBACKS:
+        fb_provider = str(fb.get("provider") or "").strip()
+        fb_model    = str(fb.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            continue
+        if not _is_provider_healthy(fb_provider):
+            logger.debug("model-router: classifier fallback %r unhealthy; skipping", fb_provider)
+            continue
+        fb_base_url = _PROVIDER_BASE_URLS.get(fb_provider)
+        try:
+            fb_extra: dict[str, Any] = {}
+            fb_reasoning = fb.get("reasoning_effort")
+            if fb_reasoning:
+                fb_extra["reasoning_effort"] = fb_reasoning
+            response = call_llm(
+                provider=fb_provider,
+                model=fb_model,
+                base_url=fb_base_url,
+                messages=messages,
+                max_tokens=3,
+                temperature=0.0,
+                extra_body=fb_extra or None,
+            )
+            tier = _parse_tier(response)
+            if tier is not None:
+                logger.info("model-router: classifier fallback %r/%s succeeded", fb_provider, fb_model)
+                return tier
+        except Exception as exc:
+            logger.warning("model-router: classifier fallback %r/%s failed: %s", fb_provider, fb_model, exc)
+            _mark_provider_failed(fb_provider)
+
+    logger.warning("model-router: all classifier providers exhausted -- defaulting T2")
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +496,88 @@ def _evict_stale_sessions() -> None:
                 d.pop(sid, None)
     if stale:
         logger.debug("model-router: evicted %d stale session(s)", len(stale))
+
+
+# ---------------------------------------------------------------------------
+# Provider health tracking
+# ---------------------------------------------------------------------------
+
+def _mark_provider_failed(provider: str) -> None:
+    """Record a provider failure timestamp for health-check gating."""
+    if not provider:
+        return
+    with _state_lock:
+        _provider_failures[provider.lower()] = time.monotonic()
+    logger.info("model-router: provider %r marked unhealthy (TTL %ss)", provider, _PROVIDER_UNHEALTHY_TTL)
+
+
+def _is_provider_healthy(provider: str) -> bool:
+    """Return True when provider has not failed recently (or has no recorded failure)."""
+    if not provider:
+        return True
+    with _state_lock:
+        failed_at = _provider_failures.get(provider.lower(), 0.0)
+    return (time.monotonic() - failed_at) > _PROVIDER_UNHEALTHY_TTL
+
+
+def _select_tier_entry(tier: int) -> tuple[str, str | None, str]:
+    """Return (model, reasoning, provider) for tier, skipping unhealthy primary provider.
+
+    Falls through the PROVIDER_PRIORITY order.  Returns the primary entry if
+    no fallback improves things (caller handles the error naturally).
+    """
+    tier_data = TIERS.get(tier, {})
+    primary_model     = tier_data.get("model", "")
+    primary_reasoning = tier_data.get("reasoning")
+    primary_provider  = PROVIDER_PRIORITY[0] if PROVIDER_PRIORITY else ""
+
+    if _is_provider_healthy(primary_provider):
+        return primary_model, primary_reasoning, primary_provider
+
+    for fb in TIER_FALLBACKS.get(tier, []):
+        fb_provider = str(fb.get("provider") or "").strip()
+        fb_model    = str(fb.get("model") or "").strip()
+        if fb_provider and fb_model and _is_provider_healthy(fb_provider):
+            logger.info(
+                "model-router: T%d primary provider %r unhealthy; using fallback %r/%s",
+                tier, primary_provider, fb_provider, fb_model,
+            )
+            return fb_model, fb.get("reasoning", primary_reasoning), fb_provider
+
+    # All providers unhealthy — use primary and let hermes handle the error
+    return primary_model, primary_reasoning, primary_provider
+
+
+def _sync_tier_fallbacks_to_config(tier: int) -> None:
+    """Write tier-specific fallback chain to config.yaml fallback_providers.
+
+    This lets hermes' built-in fallback mechanism handle provider-level failures
+    during the actual LLM call with the tier-appropriate model chain.
+    """
+    fallbacks = TIER_FALLBACKS.get(tier, [])
+    if not fallbacks:
+        return
+    try:
+        from hermes_cli.config import load_config, save_config  # type: ignore
+
+        cfg = load_config()
+        entries = []
+        for fb in fallbacks:
+            prov  = str(fb.get("provider") or "").strip()
+            model = str(fb.get("model") or "").strip()
+            if not prov or not model:
+                continue
+            entry: dict[str, Any] = {"provider": prov, "model": model}
+            base_url = _PROVIDER_BASE_URLS.get(prov)
+            if base_url:
+                entry["base_url"] = base_url
+            entries.append(entry)
+        if entries:
+            cfg["fallback_providers"] = entries
+            save_config(cfg)
+            logger.debug("model-router: synced T%d fallbacks to config.yaml fallback_providers", tier)
+    except Exception as exc:
+        logger.debug("model-router: could not sync tier fallbacks to config: %s", exc)
 
 
 def bind_session_agent(session_id: str, agent: Any) -> None:
@@ -674,15 +858,22 @@ def prepare_turn(
 # ---------------------------------------------------------------------------
 
 def _apply_tier(session_id: str, target_tier: int, current_model: str, source: str = "") -> None:
-    """Switch agent.model + reasoning_config to target_tier. Emits badge."""
+    """Switch agent.model + reasoning_config to target_tier. Emits badge.
+
+    Uses _select_tier_entry to skip unhealthy primary providers.
+    Syncs tier-specific fallback_providers to config.yaml for hermes-native fallback.
+    """
     global _manager_ref
 
     if _manager_ref is None:
         return
 
-    target_model     = TIERS[target_tier]["model"]
-    target_reasoning = TIERS[target_tier]["reasoning"]
-    current_tier     = MODEL_TO_TIER.get(current_model, 2)
+    target_model, target_reasoning, _ = _select_tier_entry(target_tier)
+    current_tier = MODEL_TO_TIER.get(current_model, 2)
+
+    # Sync this tier's fallback chain to config.yaml so hermes handles
+    # provider failures during the actual LLM call automatically.
+    _sync_tier_fallbacks_to_config(target_tier)
 
     # Apply status bar patch lazily (needs cli ref)
     try:
@@ -912,6 +1103,32 @@ def on_post_llm_call(
 
 
 # ---------------------------------------------------------------------------
+# Hook: api_request_error  (fires on every failed LLM API call in the loop)
+# ---------------------------------------------------------------------------
+
+def on_api_request_error(
+    *,
+    provider: str = "",
+    session_id: str = "",
+    error: dict | None = None,
+    retryable: bool | None = None,
+    **kwargs: Any,
+) -> None:
+    """Track provider failures for proactive health-gating.
+
+    Only marks a provider unhealthy on non-retryable errors to avoid
+    penalizing transient blips that hermes already retries automatically.
+    """
+    if not provider:
+        return
+    # Skip retryable transient errors (5xx, 408, partial reads) — hermes
+    # will retry those automatically and we shouldn't penalize the provider.
+    if retryable is True:
+        return
+    _mark_provider_failed(provider)
+
+
+# ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
 
@@ -919,8 +1136,9 @@ def register(ctx) -> None:
     global _manager_ref
     _load_router_config()
     _manager_ref = ctx._manager
-    ctx.register_hook("pre_llm_call",   on_pre_llm_call)
-    ctx.register_hook("post_llm_call",  on_post_llm_call)
+    ctx.register_hook("pre_llm_call",      on_pre_llm_call)
+    ctx.register_hook("post_llm_call",     on_post_llm_call)
+    ctx.register_hook("api_request_error", on_api_request_error)
     ctx.register_hook("post_tool_call", on_post_tool_call)
 
     # Expose public API on the PluginManager so slash commands (/t1-/t5, /auto)

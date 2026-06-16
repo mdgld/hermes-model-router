@@ -20,7 +20,6 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-
 import yaml
 
 
@@ -31,6 +30,7 @@ SOUL_BLOCK_END = "<!-- model-router:end -->"
 # KEEP IN SYNC with __init__.py DEFAULT_ROUTER_CONFIG — duplicated intentionally
 # so install.py remains a self-contained script with no import dependencies.
 DEFAULT_ROUTER_CONFIG = {
+    "provider_priority": ["nous", "openai-codex", "openrouter"],
     "classifier": {
         "provider": "openrouter",
         "model": "qwen/qwen3.5-flash-02-23",
@@ -38,6 +38,10 @@ DEFAULT_ROUTER_CONFIG = {
         "api_key": "",
         "timeout": 30,
         "extra_body": {"enable_caching": True},
+        "fallbacks": [
+            {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning_effort": "low"},
+            {"provider": "openrouter", "model": "qwen/qwen3.5-flash-02-23"},
+        ],
     },
     "tiers": {
         1: {
@@ -52,6 +56,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Status checks",
                 "Title generation",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "low"},
+                {"provider": "openrouter", "model": "qwen/qwen3.5-flash-02-23"},
+            ],
         },
         2: {
             "label": "T2 DeepSeek",
@@ -63,6 +71,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Default day-to-day work",
                 "Documentation and drafting",
                 "Standard coding and research",
+            ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "high"},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash"},
             ],
         },
         3: {
@@ -77,6 +89,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Large-document synthesis",
                 "Complex analysis",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "xhigh"},
+                {"provider": "openrouter", "model": "minimax/minimax-m2.7"},
+            ],
         },
         4: {
             "label": "T4 DeepSeek Pro",
@@ -90,6 +106,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Complex multi-step design",
                 "Nuanced code review",
             ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.4", "reasoning": "medium"},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "high"},
+            ],
         },
         5: {
             "label": "T5 Sonnet",
@@ -101,6 +121,10 @@ DEFAULT_ROUTER_CONFIG = {
                 "Security-sensitive analysis",
                 "Algorithmic optimization",
                 "High-stakes reasoning",
+            ],
+            "fallbacks": [
+                {"provider": "openai-codex", "model": "gpt-5.5", "reasoning": "high"},
+                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4-6", "reasoning": "medium"},
             ],
         },
     },
@@ -297,6 +321,13 @@ CLI_INLINE_ROUTING_BLOCK = """                # Handle /model directly on the UI
                         if event.app.is_running:
                             event.app.exit()
                     event.app.current_buffer.reset(append_to_history=True)
+                    # Force a repaint: process_command() prints through
+                    # patch_stdout (scrolls output above the prompt) and never
+                    # invalidates the app, so the just-cleared input area can
+                    # keep showing the submitted text until some unrelated
+                    # redraw fires. Every other early-return branch in this
+                    # handler invalidates after reset — match them.
+                    event.app.invalidate()
                     return
 
 """
@@ -1388,7 +1419,7 @@ def repair_cli_py(cli_path: Path) -> bool:
         text=text,
         expected_block=CLI_REF_BLOCK,
         existing_pattern=r'^\s*# Ensure plugin manager has a CLI reference even in non-interactive.*?^\s*pass\n+',
-        insert_anchor_pattern=r"^\s*if not self\._ensure_runtime_credentials\(\):\n\s*return False\n",
+        insert_anchor_pattern=r"^\s*if not self\._ensure_runtime_credentials\(\):\n\s*return None\n",
         insert_after_match=True,
         missing_error="Could not locate runtime credential guard in cli.py for model-router patching",
     )
@@ -2034,6 +2065,12 @@ def ensure_plugin_enabled(text: str) -> tuple[str, bool]:
     if not plugins_match:
         return text.rstrip("\n") + "\nplugins:\n  enabled:\n    - model-router\n", True
 
+    # Replace `enabled: null` (scalar) with a proper list including model-router.
+    null_match = re.search(r"^(plugins:\n(?:  .*\n)*?)  enabled: null\n", text, flags=re.MULTILINE)
+    if null_match:
+        updated = text[:null_match.start(1)] + null_match.group(1) + "  enabled:\n    - model-router\n" + text[null_match.end():]
+        return updated, True
+
     enabled_match = re.search(r"^plugins:\n(?:  .*\n)*?  enabled:\n", text, flags=re.MULTILINE)
     if enabled_match:
         insert_at = enabled_match.end()
@@ -2243,12 +2280,69 @@ def install_for_target(name: str, home_dir: Path, canonical_dir: Path) -> None:
     ensure_soul(home_dir)
 
 
+_PROVIDER_BASE_URLS: dict[str, str] = {
+    "nous": "https://inference-api.nousresearch.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "openai": "https://api.openai.com/v1",
+}
+
+
+def configure_classifier(home_root: Path) -> None:
+    """Interactive prompt to reconfigure the flash classifier in model_router.yaml."""
+    path = router_config_path(home_root)
+    if path.exists():
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        config = normalize_router_config(raw)
+    else:
+        config = normalize_router_config({})
+
+    cur = config["classifier"]
+    cur_reasoning = cur.get("extra_body", {}).get("reasoning_effort", "")
+
+    print("\n=== Classifier Configuration ===")
+    print(f"Current: {cur['provider']} / {cur['model']}")
+    print("Press Enter to keep the current value.\n")
+
+    provider = input(f"Provider [{cur['provider']}]: ").strip() or cur["provider"]
+    default_url = _PROVIDER_BASE_URLS.get(provider, cur["base_url"])
+    base_url = input(f"Base URL [{default_url}]: ").strip() or default_url
+    model = input(f"Classifier model [{cur['model']}]: ").strip() or cur["model"]
+    reasoning = (
+        input(f"Reasoning effort (low/medium/high, blank to disable) [{cur_reasoning}]: ")
+        .strip()
+    )
+
+    config["classifier"]["provider"] = provider
+    config["classifier"]["base_url"] = base_url
+    config["classifier"]["model"] = model
+
+    extra_body: dict = config["classifier"].get("extra_body") or {}
+    if reasoning:
+        extra_body["reasoning_effort"] = reasoning
+    else:
+        extra_body.pop("reasoning_effort", None)
+    config["classifier"]["extra_body"] = extra_body
+
+    rendered = render_router_config(config)
+    path.write_text(rendered, encoding="utf-8")
+    path.chmod(0o600)
+    ok(f"Updated classifier → {provider} / {model}")
+
+
 def main(argv: list[str]) -> int:
     home_root = root_home()
     if argv and argv[0] == "--startup-status":
         profile_name = argv[1] if len(argv) > 1 and argv[1].strip() else "default"
         print(startup_status(home_root, profile_name))
         return 0
+
+    configure = "--configure" in argv
+    argv = [a for a in argv if a != "--configure"]
+
+    if configure:
+        configure_classifier(home_root)
 
     targets = discover_targets(home_root, argv)
     repair_hermes_core(home_root)
