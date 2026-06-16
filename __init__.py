@@ -474,10 +474,12 @@ _base_tier:       dict[str, int] = {}              # session_id -> tier for this
 _tool_errors:     dict[str, int] = {}              # session_id -> consecutive tool error count this turn
 _escalated:       dict[str, bool] = {}             # session_id -> True if we already escalated mid-turn
 _live_agents:     dict[str, Any] = {}              # session_id -> active agent bound by WebUI/CLI bridge
+_live_tui_sessions: dict[str, tuple[str, dict]] = {}  # session_id -> (tui_sid, session_dict) for TUI mode
 _session_ts:      dict[str, float] = {}            # session_id -> last-seen monotonic timestamp
 _SESSION_TTL      = 86_400.0                       # evict sessions idle longer than 24 h
 _state_lock = threading.Lock()
 _patch_lock = threading.Lock()                     # guards _patch_status_bar double-patch check
+_tui_server_module: Any = None                     # cached tui_gateway.server module (pre-loaded at register time)
 
 def get_last_tier(session_id: str) -> int:
     with _state_lock:
@@ -492,7 +494,7 @@ def _evict_stale_sessions() -> None:
         for sid in stale:
             for d in (
                 _session_last, _session_manual, _session_pinned, _last_tier,
-                _base_tier, _tool_errors, _escalated, _live_agents, _session_ts,
+                _base_tier, _tool_errors, _escalated, _live_agents, _live_tui_sessions, _session_ts,
             ):
                 d.pop(sid, None)
     if stale:
@@ -741,15 +743,17 @@ def _get_live_agent(session_id: str = "") -> Any | None:
     # TUI gateway mode: scan tui_gateway.server._sessions for matching agent.
     # _cli_ref is None in TUI mode; the desktop TUI uses its own server module
     # with a _sessions dict keyed by TUI client session IDs.
-    if session_id:
+    # _tui_server_module is pre-cached at register() time to avoid per-call import races.
+    if session_id and _tui_server_module is not None:
         try:
-            import tui_gateway.server as _tui_srv  # noqa: PLC0415
-            _tui_sessions: dict = getattr(_tui_srv, "_sessions", {})
-            _tui_lock = getattr(_tui_srv, "_sessions_lock", None)
+            _tui_sessions: dict = getattr(_tui_server_module, "_sessions", {})
+            _tui_lock = getattr(_tui_server_module, "_sessions_lock", None)
             ctx = _tui_lock if _tui_lock is not None else contextlib.nullcontext()
             found_agent = None
+            found_sid: str = ""
+            found_sess: dict = {}
             with ctx:
-                for _sess in _tui_sessions.values():
+                for _sid_key, _sess in _tui_sessions.items():
                     _a = _sess.get("agent")
                     if _a is None:
                         continue
@@ -757,13 +761,16 @@ def _get_live_agent(session_id: str = "") -> Any | None:
                     # compression rotations update both fields together).
                     if _sess.get("session_key") == session_id or getattr(_a, "session_id", "") == session_id:
                         found_agent = _a
+                        found_sid = _sid_key
+                        found_sess = _sess
                         break
             if found_agent is not None:
                 with _state_lock:
                     _live_agents[session_id] = found_agent
+                    _live_tui_sessions[session_id] = (found_sid, found_sess)
                 return found_agent
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("model-router: TUI scan error: %s", exc)
 
     return None
 
@@ -899,7 +906,7 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
     if _manager_ref is None:
         return
 
-    target_model, target_reasoning, _ = _select_tier_entry(target_tier)
+    target_model, target_reasoning, provider = _select_tier_entry(target_tier)
     current_tier = MODEL_TO_TIER.get(current_model, 2)
 
     # Apply status bar patch lazily (needs cli ref)
@@ -923,6 +930,24 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
             agent.reasoning_config = {"effort": target_reasoning}
         else:
             agent.reasoning_config = None
+
+        # In TUI mode, also invoke the proper switch mechanism so the shared
+        # OpenAI client, provider, base_url, and status bar all update via
+        # agent.switch_model() — direct attribute assignment is not enough there.
+        tui_ctx = None
+        with _state_lock:
+            tui_ctx = _live_tui_sessions.get(session_id)
+        if tui_ctx is not None and _tui_server_module is not None:
+            try:
+                _sid_tui, _sess_tui = tui_ctx
+                model_spec = f"{target_model} --provider {provider}"
+                _tui_server_module._apply_model_switch(
+                    _sid_tui, _sess_tui, model_spec,
+                    confirm_expensive_model=False,
+                    pin_session_override=False,
+                )
+            except Exception as exc:
+                logger.debug("model-router: TUI _apply_model_switch failed: %s", exc)
 
         _record_router_set(session_id)
 
@@ -1210,6 +1235,18 @@ def register(ctx) -> None:
     mgr.router_prepare_turn  = prepare_turn
     mgr.router_bind_agent    = bind_session_agent
     mgr.router_unbind_agent  = unbind_session_agent
+
+    # Pre-cache tui_gateway.server at startup so the module is guaranteed to be
+    # importable when _get_live_agent fires during a TUI session. Importing here
+    # (vs. per-call) means failure shows up in the log at load time, not silently
+    # per-turn inside an except-pass block.
+    global _tui_server_module
+    try:
+        import tui_gateway.server as _tui_srv_mod  # noqa: PLC0415
+        _tui_server_module = _tui_srv_mod
+        logger.debug("model-router: tui_gateway.server cached at register time")
+    except ImportError:
+        logger.debug("model-router: tui_gateway.server not available (non-TUI mode)")
 
     logger.info(
         "model-router: registered -- Flash T1-T5 routing | explicit hints | "
