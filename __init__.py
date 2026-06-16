@@ -20,6 +20,7 @@ Features:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import os
@@ -715,7 +716,7 @@ def _patch_status_bar(cli) -> None:
 # ---------------------------------------------------------------------------
 
 def _get_live_agent(session_id: str = "") -> Any | None:
-    """Return the active agent for this session from CLI or WebUI bindings."""
+    """Return the active agent for this session from CLI, gateway, or TUI bindings."""
     with _state_lock:
         bound_agent = _live_agents.get(session_id) if session_id else None
     if bound_agent is not None:
@@ -723,17 +724,48 @@ def _get_live_agent(session_id: str = "") -> Any | None:
 
     if _manager_ref is None:
         return None
+
+    # CLI mode: direct agent reference via _cli_ref
     try:
         cli = _manager_ref._cli_ref
         agent = getattr(cli, "agent", None) if cli else None
-        if agent is None:
-            return None
-        if not session_id:
-            return agent
-        agent_session = getattr(agent, "session_id", "") or ""
-        return agent if agent_session == session_id else None
+        if agent is not None:
+            if not session_id:
+                return agent
+            agent_session = getattr(agent, "session_id", "") or ""
+            if agent_session == session_id:
+                return agent
     except Exception:
-        return None
+        pass
+
+    # TUI gateway mode: scan tui_gateway.server._sessions for matching agent.
+    # _cli_ref is None in TUI mode; the desktop TUI uses its own server module
+    # with a _sessions dict keyed by TUI client session IDs.
+    if session_id:
+        try:
+            import tui_gateway.server as _tui_srv  # noqa: PLC0415
+            _tui_sessions: dict = getattr(_tui_srv, "_sessions", {})
+            _tui_lock = getattr(_tui_srv, "_sessions_lock", None)
+            ctx = _tui_lock if _tui_lock is not None else contextlib.nullcontext()
+            found_agent = None
+            with ctx:
+                for _sess in _tui_sessions.values():
+                    _a = _sess.get("agent")
+                    if _a is None:
+                        continue
+                    # session_key is kept in sync with agent.session_id (even after
+                    # compression rotations update both fields together).
+                    if _sess.get("session_key") == session_id or getattr(_a, "session_id", "") == session_id:
+                        found_agent = _a
+                        break
+            if found_agent is not None:
+                with _state_lock:
+                    _live_agents[session_id] = found_agent
+                return found_agent
+        except Exception:
+            pass
+
+    return None
 
 
 def _target_tier_for_turn(session_id: str, msg: str, history: list, current_model: str) -> tuple[int, bool]:
