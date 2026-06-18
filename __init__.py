@@ -70,6 +70,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "low", "extra_body": {"enable_caching": True}},
+                {"provider": "nous", "model": "deepseek/deepseek-v4-flash", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "xiaomi/mimo-v2.5-pro", "reasoning": "enabled", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -87,6 +88,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "medium", "extra_body": {"enable_caching": True}},
+                {"provider": "nous", "model": "deepseek/deepseek-v4-flash", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "max", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -104,6 +106,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
+                {"provider": "nous", "model": "deepseek/deepseek-v4-pro", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "minimax/minimax-m3", "reasoning": "enabled", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -123,6 +126,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4", "reasoning": "high", "extra_body": {"enable_caching": True}},
+                {"provider": "nous", "model": "z-ai/glm-5.2", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "z-ai/glm-5.2", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -142,6 +146,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.5", "reasoning": "high"},
+                {"provider": "nous", "model": "z-ai/glm-5.2", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "openai/gpt-latest", "reasoning": "high", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -711,8 +716,17 @@ def _patch_status_bar(cli) -> None:
                 if not current_model:
                     # Fallback to tier's default model if agent.model is somehow empty
                     current_model = TIERS.get(tier, {}).get("model", "")
-                # Extract just the short name (e.g. "claude-sonnet-4-6" from "anthropic/claude-sonnet-4-6")
+                # Extract a short display name:
+                #   openai/gpt-5.5          → gpt-5.5
+                #   global.anthropic.claude-sonnet-4-6 → claude-sonnet-4-6
+                #   us.anthropic.claude-opus-4-8      → claude-opus-4-8
+                #   bare-model-id                     → bare-model-id
                 name_only = current_model.split("/")[-1] if current_model else "unknown"
+                # Strip Bedrock inference-profile prefixes
+                for prefix in ("global.anthropic.", "us.anthropic.", "eu.anthropic.", "apac.anthropic."):
+                    if name_only.startswith(prefix):
+                        name_only = name_only[len(prefix):]
+                        break
                 snap["model_short"] = prefix + name_only
             return snap
 
@@ -881,6 +895,8 @@ def prepare_turn(
             )
             _apply_tier(session_id, target_tier, actual_model, source="")
         else:
+            if agent is not None:
+                _sync_fallback_chain(agent, target_tier)
             try:
                 cli = _manager_ref._cli_ref if _manager_ref is not None else None
                 if cli:
@@ -891,6 +907,8 @@ def prepare_turn(
         # WebUI may pre-resolve the routed model before the hook fires; if a
         # reused cached agent still carries the old model/provider, normalize it here.
         _apply_tier(session_id, target_tier, actual_model, source="webui-sync")
+    elif agent is not None:
+        _sync_fallback_chain(agent, target_tier)
 
     return {
         "session_id": session_id,
@@ -906,6 +924,33 @@ def prepare_turn(
 # ---------------------------------------------------------------------------
 # Apply model switch helper
 # ---------------------------------------------------------------------------
+
+def _sync_fallback_chain(agent: Any, target_tier: int) -> None:
+    tier_fb = TIER_FALLBACKS.get(target_tier, [])
+    if tier_fb:
+        entries = []
+        for fb in tier_fb:
+            prov = str(fb.get("provider") or "").strip()
+            fb_model = str(fb.get("model") or "").strip()
+            if not prov or not fb_model:
+                continue
+            entry: dict[str, Any] = {"provider": prov, "model": fb_model}
+            fb_base_url = _PROVIDER_BASE_URLS.get(prov)
+            if fb_base_url:
+                entry["base_url"] = fb_base_url
+            # preserve reasoning if present
+            if "reasoning" in fb:
+                entry["reasoning"] = fb["reasoning"]
+            elif "reasoning_effort" in fb:
+                entry["reasoning_effort"] = fb["reasoning_effort"]
+            entries.append(entry)
+        
+        if entries:
+            agent._fallback_chain = entries
+            agent._fallback_index = 0
+            agent._fallback_model = entries[0]
+            agent._fallback_activated = False
+
 
 def _apply_tier(session_id: str, target_tier: int, current_model: str, source: str = "") -> None:
     """Switch agent.model + reasoning_config to target_tier. Emits badge.
@@ -974,8 +1019,7 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
             agent.model = target_model
             if provider:
                 agent.provider = provider
-            if base_url:
-                agent.base_url = base_url
+            agent.base_url = base_url or None
             if api_mode:
                 agent.api_mode = api_mode
 
@@ -988,6 +1032,9 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
 
         with _state_lock:
             _last_tier[session_id] = target_tier
+
+        # Set the agent's fallback chain directly for this tier instead of syncing to config.yaml
+        _sync_fallback_chain(agent, target_tier)
 
         emoji, label = _TIER_LABELS.get(target_tier, ("", f"T{target_tier}"))
         src_tag = f" [{source}]" if source else ""
