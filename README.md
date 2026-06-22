@@ -1,6 +1,56 @@
 # model-router
 
-Automatic cost-aware model routing for Hermes Agent. 
+Automatic cost-aware model routing for Hermes Agent. Fork of model-router by Jakub Misiak.
+
+## Fork Differences from Upstream
+
+This fork (`mdgld/hermes-model-router`) extends `open-world-project/model-router` with capabilities not present in the parent plugin.
+
+### Multi-Provider Fallback Chains
+
+The upstream routes all tiers through a single provider. This fork adds:
+
+- `TIER_FALLBACKS`: each tier carries an ordered list of `{provider, model, reasoning}` entries.
+- Live provider health tracking (`_provider_failures`, 120 s TTL): when a provider errors, `_select_tier_entry()` skips it and walks the fallback chain automatically, then restores the primary once it recovers.
+- First-party **Nous** (`nous`) and **OpenAI Codex** (`openai-codex`) provider support alongside OpenRouter.
+
+### AWS Bedrock Support
+
+- `determine_api_mode("bedrock", "")` routes to the `bedrock_converse` path (boto3 transport, no OpenAI SDK client).
+- `switch_model()` correctly updates the `BedrockTransport` session.
+- Bedrock thinking payload uses `additionalModelRequestFields.thinking.type = "adaptive"` with effort under `output_config`, matching the Converse API contract.
+
+### TUI Desktop Session Management
+
+The upstream supports only the CLI path (`_cli_ref`). This fork adds:
+
+- TUI session scanning via `tui_gateway.server._sessions` to locate the live agent by `session_key`.
+- `_live_tui_sessions` cache so `_apply_tier()` can call `_apply_model_switch()` in TUI mode, updating the OpenAI client, provider, base_url, and api_key together (direct `agent.model = ...` assignment is insufficient in TUI mode).
+- `session.info` status-bar events emitted on every tier switch and mid-turn fallback activation.
+
+### Status Bar Sync for Mid-Turn Fallbacks
+
+When `_try_activate_fallback()` switches `agent.model`/`agent.provider`, the upstream never notifies `_session_runtime_state` or the TUI. This fork detects `agent._fallback_activated` in `on_post_llm_call` and syncs both the state dict and the status bar event.
+
+### Per-Call Task-Band Routing
+
+New `task_routes` config key defines a complexity band `[floor_tier, working_tier]` per task type. After `threshold` consecutive read-only tool calls (the `_mechanical_streak`), the router drops the active tier to `floor_tier` for the next LLM call, then restores it to `working_tier` on any write, execution, delegation tool, or tool error. This keeps exploration-heavy turns from burning the full high-reasoning budget on mechanical reads.
+
+Config schema additions:
+
+```yaml
+task_routes:
+  - name: debugging
+    working_tier: 5   # tier used for planning/writing/synthesis
+    floor_tier: 3     # tier used during read-only exploration streaks
+    priority: 75
+    keywords: [debug, bug, root cause, traceback]
+default_floor_delta: 2   # fallback floor = working_tier - delta (classifier path)
+```
+
+The `tier` key is preserved as a back-compat alias for `working_tier`, so existing configs continue to work unchanged.
+
+---
 
 `model-router` classifies each turn, picks the cheapest tier that should work, and escalates only when the task needs more reasoning.
 
@@ -221,54 +271,6 @@ cat ~/.hermes/SOUL.md
 - `/t1` to `/t5` use the wrong models: edit the correct `model_router.yaml`, re-run `install.sh`, and restart Hermes.
 - Hermes update changed patched core files: just launch Hermes and let startup validation repair it, or run `bash install.sh` manually if you want to refresh it before launch.
 - Re-run safety: repeated `bash install.sh` runs are supported and only rewrite managed files when they drift or are damaged.
-
-## Fork Differences from Upstream
-
-This fork (`mdgld/hermes-model-router`) extends `open-world-project/model-router` with capabilities not present in the parent plugin.
-
-### Multi-Provider Fallback Chains
-
-The upstream routes all tiers through a single provider. This fork adds:
-
-- `TIER_FALLBACKS`: each tier carries an ordered list of `{provider, model, reasoning}` entries.
-- Live provider health tracking (`_provider_failures`, 120 s TTL): when a provider errors, `_select_tier_entry()` skips it and walks the fallback chain automatically, then restores the primary once it recovers.
-- First-party **Nous** (`nous`) and **OpenAI Codex** (`openai-codex`) provider support alongside OpenRouter.
-
-### AWS Bedrock Support
-
-- `determine_api_mode("bedrock", "")` routes to the `bedrock_converse` path (boto3 transport, no OpenAI SDK client).
-- `switch_model()` correctly updates the `BedrockTransport` session.
-- Bedrock thinking payload uses `additionalModelRequestFields.thinking.type = "adaptive"` with effort under `output_config`, matching the Converse API contract.
-
-### TUI Desktop Session Management
-
-The upstream supports only the CLI path (`_cli_ref`). This fork adds:
-
-- TUI session scanning via `tui_gateway.server._sessions` to locate the live agent by `session_key`.
-- `_live_tui_sessions` cache so `_apply_tier()` can call `_apply_model_switch()` in TUI mode, updating the OpenAI client, provider, base_url, and api_key together (direct `agent.model = ...` assignment is insufficient in TUI mode).
-- `session.info` status-bar events emitted on every tier switch and mid-turn fallback activation.
-
-### Status Bar Sync for Mid-Turn Fallbacks
-
-When `_try_activate_fallback()` switches `agent.model`/`agent.provider`, the upstream never notifies `_session_runtime_state` or the TUI. This fork detects `agent._fallback_activated` in `on_post_llm_call` and syncs both the state dict and the status bar event.
-
-### Per-Call Task-Band Routing
-
-New `task_routes` config key defines a complexity band `[floor_tier, working_tier]` per task type. After `threshold` consecutive read-only tool calls (the `_mechanical_streak`), the router drops the active tier to `floor_tier` for the next LLM call, then restores it to `working_tier` on any write, execution, delegation tool, or tool error. This keeps exploration-heavy turns from burning the full high-reasoning budget on mechanical reads.
-
-Config schema additions:
-
-```yaml
-task_routes:
-  - name: debugging
-    working_tier: 5   # tier used for planning/writing/synthesis
-    floor_tier: 3     # tier used during read-only exploration streaks
-    priority: 75
-    keywords: [debug, bug, root cause, traceback]
-default_floor_delta: 2   # fallback floor = working_tier - delta (classifier path)
-```
-
-The `tier` key is preserved as a back-compat alias for `working_tier`, so existing configs continue to work unchanged.
 
 ---
 
