@@ -1,6 +1,6 @@
 name: model-router
 version: "1.0.0"
-description: "Cost-aware automatic model routing. Classifies each turn by complexity and switches to the cheapest tier that can handle it — T1 (flash/cheap) through T5 (high-reasoning). Configured via model_router.yaml."
+description: "Cost-aware automatic model routing with per-call task-band heuristics. Classifies each turn by complexity and switches to the cheapest tier that can handle it — T1 (flash/cheap) through T5 (high-reasoning), downgrading to floor tiers for mechanical read-only steps. Configured via model_router.yaml."
 author: Jakub Misiak
 provides_hooks:
   - pre_llm_call

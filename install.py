@@ -66,7 +66,7 @@ DEFAULT_ROUTER_CONFIG = {
             "label": "T2 (DeepSeek v4 Pro)",
             "emoji": "🔹",
             "model": "deepseek/deepseek-v4-pro",
-            "reasoning": "max",
+            "reasoning": "xhigh",
             "extra_body": {"enable_caching": True},
             "role": "day-to-day usage, basic tasks",
             "best_for": [
@@ -76,7 +76,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "medium", "extra_body": {"enable_caching": True}},
-                {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "max", "extra_body": {"enable_caching": True}},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
             ],
         },
         3: {
@@ -92,7 +92,7 @@ DEFAULT_ROUTER_CONFIG = {
                 "Standard reasoning",
             ],
             "fallbacks": [
-                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
+                {"provider": "openai-codex", "model": "gpt-5.4", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "minimax/minimax-m3", "reasoning": "enabled", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -135,6 +135,65 @@ DEFAULT_ROUTER_CONFIG = {
             ],
         },
     },
+    "task_routes": [
+        {
+            "name": "security",
+            "tier": 5,
+            "working_tier": 5,
+            "floor_tier": 4,
+            "priority": 100,
+            "keywords": ["security", "vulnerability", "exploit", "auth", "secret", "threat model"],
+        },
+        {
+            "name": "algorithmic_optimization",
+            "tier": 5,
+            "working_tier": 5,
+            "floor_tier": 3,
+            "priority": 95,
+            "keywords": ["algorithm", "complexity", "optimize", "optimization", "benchmark", "performance"],
+        },
+        {
+            "name": "architecture_planning",
+            "tier": 4,
+            "working_tier": 4,
+            "floor_tier": 3,
+            "priority": 80,
+            "keywords": ["architecture", "design", "migration", "refactor", "workflow", "plan"],
+        },
+        {
+            "name": "debugging",
+            "tier": 2,
+            "working_tier": 2,
+            "floor_tier": 1,
+            "priority": 75,
+            "keywords": ["debug", "bug", "root cause", "traceback", "stack trace", "failing test", "regression", "investigate"],
+        },
+        {
+            "name": "normal_coding",
+            "tier": 1,
+            "working_tier": 1,
+            "floor_tier": 1,
+            "priority": 55,
+            "keywords": ["implement", "add function", "write code", "build", "feature", "endpoint"],
+        },
+        {
+            "name": "quick_edit",
+            "tier": 1,
+            "working_tier": 1,
+            "floor_tier": 1,
+            "priority": 50,
+            "keywords": ["rename", "typo", "tweak", "one-liner", "small fix", "adjust", "bump"],
+        },
+        {
+            "name": "drafting_summary",
+            "tier": 1,
+            "working_tier": 1,
+            "floor_tier": 1,
+            "priority": 40,
+            "keywords": ["draft", "rewrite", "summarize", "summary", "email", "docs", "documentation"],
+        },
+    ],
+    "default_floor_delta": 2,
     "integrations": {
         "hermes_webui_dir": "",
     },
@@ -246,6 +305,10 @@ CLI_TIER_HANDLERS_BLOCK = '''    def _handle_tier_pin(self, tier_cmd: str) -> No
             _mgr = get_plugin_manager()
             _apply_fn = getattr(_mgr, "router_apply_tier", None)
             _meta_fn = getattr(_mgr, "router_get_tier_meta", None)
+            if _apply_fn is None and hasattr(_mgr, "discover_and_load"):
+                _mgr.discover_and_load()
+                _apply_fn = getattr(_mgr, "router_apply_tier", None)
+                _meta_fn = getattr(_mgr, "router_get_tier_meta", None)
             if _apply_fn is None:
                 _cprint("  ✗ model-router plugin not active — /t1-/t5 unavailable")
                 _cprint("    Enable it: add 'model-router' to plugins.enabled in config.yaml")
@@ -287,6 +350,10 @@ CLI_TIER_HANDLERS_BLOCK = '''    def _handle_tier_pin(self, tier_cmd: str) -> No
             _mgr = get_plugin_manager()
             _unpin_fn = getattr(_mgr, "router_unpin_session", None)
             _is_pinned_fn = getattr(_mgr, "router_is_pinned", None)
+            if _unpin_fn is None and hasattr(_mgr, "discover_and_load"):
+                _mgr.discover_and_load()
+                _unpin_fn = getattr(_mgr, "router_unpin_session", None)
+                _is_pinned_fn = getattr(_mgr, "router_is_pinned", None)
 
             if _unpin_fn is None:
                 _cprint("  ✗ model-router plugin not active — /auto unavailable")

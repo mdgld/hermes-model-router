@@ -30,3 +30,12 @@ Use the hermes venv — system `python3` lacks PyYAML:
 ## Git Remotes
 - `origin` → upstream `open-world-project/model-router`
 - `fork` → personal fork `mdgld/hermes-model-router` (push changes here)
+
+## Per-Call Task-Aware Routing
+- **Overview**: Optimizes LLM cost by routing mid-turn mechanical tool calls (e.g. read_file, search_files) to cheaper model tiers (the "floor tier"), while preserving the capability of high-reasoning models (the "working tier") for planning, writing/executing code, error recovery, and final synthesis.
+- **Design Rationale**:
+  - A floor tier protects the synthesis step. Each task defines a complexity band `[floor_tier, working_tier]`.
+  - Detection uses a free, zero-LLM heuristic: read-only tool streaks drop the active tier to `floor_tier`, while write/execution/delegation tools or tool errors immediately restore the tier to `working_tier`.
+- **Lag-by-One Invariant**: Switching `agent.model`/provider in `on_post_tool_call` takes effect on the *next* LLM call in the loop, which matches how the existing error-escalation system works.
+- **Read-Only Tools**: `_READ_ONLY_TOOLS` contains read-only tools: `read_file`, `view_file`, `list_dir`, `grep_search`, `search_files`, `web_search`, `web_extract`, `x_search`, `session_search`, `read_terminal`, `skills_list`, `skill_view`, `vision_analyze`, `video_analyze`, `memory`, `read_resource`, `list_resources`, `read_url_content`, and `list_permissions`.
+

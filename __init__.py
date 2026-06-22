@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import json
 import logging
 import os
 import re
@@ -78,7 +79,7 @@ DEFAULT_ROUTER_CONFIG = {
             "label": "T2 (DeepSeek v4 Pro)",
             "emoji": "🔹",
             "model": "deepseek/deepseek-v4-pro",
-            "reasoning": "max",
+            "reasoning": "xhigh",
             "extra_body": {"enable_caching": True},
             "role": "day-to-day usage, basic tasks",
             "best_for": [
@@ -89,7 +90,7 @@ DEFAULT_ROUTER_CONFIG = {
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "medium", "extra_body": {"enable_caching": True}},
                 {"provider": "nous", "model": "deepseek/deepseek-v4-flash", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
-                {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "max", "extra_body": {"enable_caching": True}},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
             ],
         },
         3: {
@@ -105,7 +106,7 @@ DEFAULT_ROUTER_CONFIG = {
                 "Standard reasoning",
             ],
             "fallbacks": [
-                {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
+                {"provider": "openai-codex", "model": "gpt-5.4", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
                 {"provider": "nous", "model": "deepseek/deepseek-v4-pro", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "minimax/minimax-m3", "reasoning": "enabled", "extra_body": {"enable_caching": True}},
             ],
@@ -126,7 +127,7 @@ DEFAULT_ROUTER_CONFIG = {
             ],
             "fallbacks": [
                 {"provider": "openai-codex", "model": "gpt-5.4", "reasoning": "high", "extra_body": {"enable_caching": True}},
-                {"provider": "nous", "model": "z-ai/glm-5.2", "reasoning_effort": "high", "extra_body": {"enable_caching": True}},
+                {"provider": "nous", "model": "z-ai/glm-5.2", "reasoning_effort": "xhigh", "extra_body": {"enable_caching": True}},
                 {"provider": "openrouter", "model": "z-ai/glm-5.2", "reasoning": "xhigh", "extra_body": {"enable_caching": True}},
             ],
         },
@@ -151,10 +152,70 @@ DEFAULT_ROUTER_CONFIG = {
             ],
         },
     },
+    "task_routes": [
+        {
+            "name": "security",
+            "tier": 5,
+            "working_tier": 5,
+            "floor_tier": 4,
+            "priority": 100,
+            "keywords": ["security", "vulnerability", "exploit", "auth", "secret", "threat model"],
+        },
+        {
+            "name": "algorithmic_optimization",
+            "tier": 5,
+            "working_tier": 5,
+            "floor_tier": 3,
+            "priority": 95,
+            "keywords": ["algorithm", "complexity", "optimize", "optimization", "benchmark", "performance"],
+        },
+        {
+            "name": "architecture_planning",
+            "tier": 4,
+            "working_tier": 4,
+            "floor_tier": 3,
+            "priority": 80,
+            "keywords": ["architecture", "design", "migration", "refactor", "workflow", "plan"],
+        },
+        {
+            "name": "debugging",
+            "tier": 2,
+            "working_tier": 2,
+            "floor_tier": 1,
+            "priority": 75,
+            "keywords": ["debug", "bug", "root cause", "traceback", "stack trace", "failing test", "regression", "investigate"],
+        },
+        {
+            "name": "normal_coding",
+            "tier": 1,
+            "working_tier": 1,
+            "floor_tier": 1,
+            "priority": 55,
+            "keywords": ["implement", "add function", "write code", "build", "feature", "endpoint"],
+        },
+        {
+            "name": "quick_edit",
+            "tier": 1,
+            "working_tier": 1,
+            "floor_tier": 1,
+            "priority": 50,
+            "keywords": ["rename", "typo", "tweak", "one-liner", "small fix", "adjust", "bump"],
+        },
+        {
+            "name": "drafting_summary",
+            "tier": 1,
+            "working_tier": 1,
+            "floor_tier": 1,
+            "priority": 40,
+            "keywords": ["draft", "rewrite", "summarize", "summary", "email", "docs", "documentation"],
+        },
+    ],
+    "default_floor_delta": 2,
 }
 
 _router_config: dict[str, Any] = copy.deepcopy(DEFAULT_ROUTER_CONFIG)
 TIERS: dict[int, dict[str, Any]] = {}
+RUNTIME_PROFILES: dict[str, dict[str, Any]] = {}
 MODEL_TO_TIER: dict[str, int] = {}
 FLASH_MODEL = ""
 FLASH_PROVIDER = ""
@@ -162,8 +223,45 @@ _TIER_LABELS: dict[int, tuple[str, str]] = {}
 PROVIDER_PRIORITY: list[str] = []
 TIER_FALLBACKS: dict[int, list[dict[str, Any]]] = {}
 CLASSIFIER_FALLBACKS: list[dict[str, Any]] = []
+TASK_ROUTES: list[dict[str, Any]] = []
 _provider_failures: dict[str, float] = {}
+_session_runtime_state: dict[str, dict[str, Any]] = {}
+_session_route_trace: dict[str, dict[str, Any]] = {}
+_startup_validation_status: dict[str, Any] = {}
 _PROVIDER_UNHEALTHY_TTL = 120.0
+
+
+def _normalize_task_routes(raw_routes: list) -> list[dict[str, Any]]:
+    """Validate, normalize, and sort task routes by descending priority."""
+    if not isinstance(raw_routes, list):
+        return []
+    normalized = []
+    for route in raw_routes:
+        if not isinstance(route, dict):
+            continue
+        name = str(route.get("name") or "").strip()
+        # working_tier is canonical; "tier" is the back-compat alias
+        working_tier = route.get("working_tier") or route.get("tier")
+        priority = route.get("priority", 50)
+        keywords = route.get("keywords", [])
+        if not name or not isinstance(working_tier, int) or working_tier not in range(1, 6):
+            continue
+        if not isinstance(keywords, list) or not keywords:
+            continue
+        floor_raw = route.get("floor_tier", working_tier)
+        floor_tier = int(floor_raw) if isinstance(floor_raw, (int, float)) else working_tier
+        floor_tier = max(1, min(floor_tier, working_tier))  # clamp: floor ∈ [1, working_tier]
+        normalized.append({
+            "name": name,
+            "tier": int(working_tier),          # back-compat for callers that only look at ["tier"]
+            "working_tier": int(working_tier),
+            "floor_tier": floor_tier,
+            "priority": int(priority) if isinstance(priority, (int, float)) else 50,
+            "keywords": [str(k).strip().lower() for k in keywords if str(k).strip()],
+        })
+    normalized.sort(key=lambda r: r["priority"], reverse=True)
+    return normalized
+
 
 _PROVIDER_BASE_URLS: dict[str, str] = {
     "nous": "https://inference-api.nousresearch.com/v1",
@@ -172,6 +270,38 @@ _PROVIDER_BASE_URLS: dict[str, str] = {
     "anthropic": "https://api.anthropic.com/v1",
     "openai": "https://api.openai.com/v1",
 }
+
+_PROVIDER_SHORT: dict[str, str] = {
+    "bedrock": "aws",
+    "openrouter": "or",
+    "openai-codex": "codex",
+    "openai": "oai",
+    "nous": "nous",
+    "anthropic": "anth",
+    "deepseek": "ds",
+}
+
+# Per-provider reasoning effort normalisation.
+# "max" is Bedrock-internal; bedrock_adapter.py already maps xhigh→max natively so
+# bedrock is left as a no-op here.  All other providers accept the canonical OpenAI
+# set: none|minimal|low|medium|high|xhigh (model-dependent per OpenAI docs).
+_PROVIDER_REASONING_NORM: dict[str, dict[str, str]] = {
+    "openrouter":   {"max": "xhigh", "enabled": "high",   "adaptive": "xhigh"},
+    "nous":         {"max": "xhigh", "enabled": "high",   "adaptive": "xhigh"},
+    "openai":       {"max": "xhigh", "enabled": "medium", "adaptive": "medium"},
+    "openai-codex": {"max": "xhigh", "enabled": "medium", "adaptive": "medium"},
+    "anthropic":    {"max": "high",  "enabled": "medium", "adaptive": "medium"},
+    "deepseek":     {"max": "high",  "xhigh": "high",     "enabled": "high",   "adaptive": "high"},
+    "bedrock":      {},
+}
+
+
+def _normalize_reasoning_for_provider(effort: str | None, provider: str) -> str | None:
+    if not effort or not provider:
+        return effort
+    p = str(provider).strip().lower()
+    mapping = _PROVIDER_REASONING_NORM.get(p, {"max": "xhigh", "enabled": "medium"})
+    return mapping.get(effort, effort)
 
 
 def _get_hermes_home() -> Path:
@@ -187,6 +317,18 @@ def _router_config_path() -> Path:
     return _get_hermes_home() / "model_router.yaml"
 
 
+def _router_state_dir() -> Path:
+    return _get_hermes_home() / "model-router"
+
+
+def _router_state_path() -> Path:
+    return _router_state_dir() / "state.json"
+
+
+def _router_events_path() -> Path:
+    return _router_state_dir() / "events.jsonl"
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(base)
     for key, value in override.items():
@@ -195,6 +337,73 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = value
     return merged
+
+
+def _determine_api_mode(provider: str, base_url: str) -> str:
+    try:
+        from hermes_cli.providers import determine_api_mode  # type: ignore
+
+        return determine_api_mode(provider, base_url)
+    except Exception:
+        return "bedrock_converse" if provider == "bedrock" else "chat_completions"
+
+
+def _normalize_runtime_profile(
+    profile_id: str,
+    raw: dict[str, Any] | None,
+    tier_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    tier_meta = tier_meta if isinstance(tier_meta, dict) else {}
+
+    provider = str(raw.get("provider") or tier_meta.get("provider") or "").strip()
+    wire_model = str(
+        raw.get("wire_model")
+        or raw.get("model")
+        or tier_meta.get("model")
+        or ""
+    ).strip()
+    base_url = str(
+        raw.get("base_url")
+        or tier_meta.get("base_url")
+        or _PROVIDER_BASE_URLS.get(provider, "")
+    ).strip()
+    api_mode = str(
+        raw.get("api_mode")
+        or tier_meta.get("api_mode")
+        or _determine_api_mode(provider, base_url)
+    ).strip()
+    request_policy = raw.get("request_policy")
+    if not isinstance(request_policy, dict):
+        request_policy = {}
+
+    capability_tags = raw.get("capability_tags")
+    if not isinstance(capability_tags, list):
+        capability_tags = []
+
+    fallback_profiles = raw.get("fallback_profiles")
+    if not isinstance(fallback_profiles, list):
+        fallback_profiles = []
+
+    return {
+        "profile_id": profile_id,
+        "display_name": str(
+            raw.get("display_name")
+            or tier_meta.get("label")
+            or profile_id
+        ),
+        "provider": provider,
+        "wire_model": wire_model,
+        "model": wire_model,
+        "base_url": base_url,
+        "api_mode": api_mode,
+        "reasoning_mode": str(raw.get("reasoning_mode") or tier_meta.get("reasoning_mode") or "").strip(),
+        "auth_source": str(raw.get("auth_source") or "").strip(),
+        "reasoning": raw.get("reasoning", tier_meta.get("reasoning")),
+        "request_policy": request_policy,
+        "fallback_profiles": fallback_profiles,
+        "capability_tags": capability_tags,
+    }
 
 
 def _normalize_router_config(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -212,14 +421,42 @@ def _normalize_router_config(raw: dict[str, Any] | None) -> dict[str, Any]:
             tier_defaults["fallbacks"] = override["fallbacks"]
         normalized_tiers[tier_num] = tier_defaults
     merged["tiers"] = normalized_tiers
+
+    raw_runtime_profiles = merged.get("runtime_profiles", {})
+    if not isinstance(raw_runtime_profiles, dict):
+        raw_runtime_profiles = {}
+
+    runtime_profiles: dict[str, dict[str, Any]] = {}
+    for profile_id, raw_profile in raw_runtime_profiles.items():
+        if isinstance(raw_profile, dict):
+            runtime_profiles[str(profile_id)] = _normalize_runtime_profile(
+                str(profile_id),
+                raw_profile,
+            )
+
+    for tier_num, tier_defaults in normalized_tiers.items():
+        profile_id = str(
+            tier_defaults.get("target")
+            or tier_defaults.get("runtime_profile")
+            or f"tier_{tier_num}"
+        )
+        tier_defaults["target"] = profile_id
+        runtime_profiles[profile_id] = _normalize_runtime_profile(
+            profile_id,
+            raw_runtime_profiles.get(profile_id),
+            tier_defaults,
+        )
+
+    merged["runtime_profiles"] = runtime_profiles
     return merged
 
 
 def _apply_router_config(config: dict[str, Any]) -> None:
-    global _router_config, TIERS, MODEL_TO_TIER, FLASH_MODEL, FLASH_PROVIDER, _TIER_LABELS
-    global PROVIDER_PRIORITY, TIER_FALLBACKS, CLASSIFIER_FALLBACKS
+    global _router_config, TIERS, RUNTIME_PROFILES, MODEL_TO_TIER, FLASH_MODEL, FLASH_PROVIDER, _TIER_LABELS
+    global PROVIDER_PRIORITY, TIER_FALLBACKS, CLASSIFIER_FALLBACKS, TASK_ROUTES
 
     _router_config = config
+    RUNTIME_PROFILES = copy.deepcopy(config.get("runtime_profiles", {}))
     TIERS = {
         tier_num: {
             "model": meta["model"],
@@ -229,6 +466,7 @@ def _apply_router_config(config: dict[str, Any]) -> None:
             "emoji": meta.get("emoji", ""),
             "role": meta.get("role", ""),
             "best_for": meta.get("best_for", []),
+            "target": meta.get("target"),
         }
         for tier_num, meta in config["tiers"].items()
     }
@@ -237,6 +475,11 @@ def _apply_router_config(config: dict[str, Any]) -> None:
     for tier_num in sorted(TIERS):
         model = TIERS[tier_num]["model"]
         model_to_tier.setdefault(model, tier_num)
+        profile_id = str(TIERS[tier_num].get("target") or "")
+        runtime_profile = RUNTIME_PROFILES.get(profile_id, {})
+        runtime_model = str(runtime_profile.get("wire_model") or "")
+        if runtime_model:
+            model_to_tier.setdefault(runtime_model, tier_num)
     MODEL_TO_TIER = model_to_tier
 
     classifier = config.get("classifier", {})
@@ -255,25 +498,373 @@ def _apply_router_config(config: dict[str, Any]) -> None:
         for tier_num, meta in config["tiers"].items()
     }
 
+    raw_task_routes = config.get("task_routes", DEFAULT_ROUTER_CONFIG.get("task_routes", []))
+    TASK_ROUTES = _normalize_task_routes(raw_task_routes)
+
+
+def _tier_profile_id(tier: int) -> str:
+    return str(TIERS.get(tier, {}).get("target") or f"tier_{tier}")
+
+
+def _runtime_bundle_from_profile(profile_id: str) -> dict[str, Any]:
+    profile = dict(RUNTIME_PROFILES.get(profile_id, {}))
+    if not profile:
+        return {}
+    profile.setdefault("profile_id", profile_id)
+    profile.setdefault("model", profile.get("wire_model", ""))
+    return profile
+
+
+def resolve_tier_runtime(tier: int) -> dict[str, Any]:
+    """Return the resolved runtime bundle for a tier.
+
+    The router resolves to a provider-specific runtime profile rather than only a
+    model slug so gateway overrides and live switches stay provider-correct.
+    """
+    tier_data = TIERS.get(tier, {})
+    profile_id = _tier_profile_id(tier)
+    primary = _runtime_bundle_from_profile(profile_id)
+    primary_provider = str(primary.get("provider") or "").strip()
+    primary_model = str(primary.get("model") or "").strip()
+
+    if primary_model and _is_provider_healthy(primary_provider):
+        return primary
+
+    for idx, fb in enumerate(TIER_FALLBACKS.get(tier, []), start=1):
+        fb_provider = str(fb.get("provider") or "").strip()
+        fb_model = str(fb.get("wire_model") or fb.get("model") or "").strip()
+        if not fb_provider or not fb_model or not _is_provider_healthy(fb_provider):
+            continue
+        logger.info(
+            "model-router: T%d primary provider %r unhealthy; using fallback %r/%s",
+            tier, primary_provider, fb_provider, fb_model,
+        )
+        fb_base_url = str(fb.get("base_url") or _PROVIDER_BASE_URLS.get(fb_provider, "")).strip()
+        return {
+            "profile_id": f"{profile_id}::fallback::{idx}",
+            "display_name": str(tier_data.get("label") or f"T{tier}"),
+            "provider": fb_provider,
+            "wire_model": fb_model,
+            "model": fb_model,
+            "base_url": fb_base_url,
+            "api_mode": str(fb.get("api_mode") or _determine_api_mode(fb_provider, fb_base_url)).strip(),
+            "reasoning_mode": str(fb.get("reasoning_mode") or "").strip(),
+            "auth_source": str(fb.get("auth_source") or "").strip(),
+            "reasoning": fb.get("reasoning", primary.get("reasoning")),
+            "request_policy": dict(fb.get("request_policy") or {}),
+            "fallback_profiles": list(fb.get("fallback_profiles") or []),
+            "capability_tags": list(fb.get("capability_tags") or []),
+        }
+
+    return primary
+
+
+def validate_router_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate router config structure. Returns {valid, warnings, errors}."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    tiers = config.get("tiers", {})
+    runtime_profiles = config.get("runtime_profiles", {})
+
+    for tier_num in range(1, 6):
+        tier = tiers.get(tier_num, tiers.get(str(tier_num), {}))
+        if not isinstance(tier, dict):
+            errors.append(f"tier {tier_num}: missing or invalid")
+            continue
+        model = str(tier.get("model") or "").strip()
+        if not model:
+            errors.append(f"tier {tier_num}: model is empty")
+        profile_id = str(tier.get("target") or f"tier_{tier_num}")
+        profile = runtime_profiles.get(profile_id, {})
+        if profile:
+            wire_model = str(profile.get("wire_model") or profile.get("model") or "").strip()
+            provider = str(profile.get("provider") or "").strip()
+            api_mode = str(profile.get("api_mode") or "").strip()
+            if not wire_model:
+                warnings.append(f"runtime profile {profile_id!r}: wire_model is empty")
+            if not provider:
+                warnings.append(f"runtime profile {profile_id!r}: provider is empty")
+            if not api_mode:
+                warnings.append(f"runtime profile {profile_id!r}: api_mode is empty")
+
+    for pid, profile in runtime_profiles.items():
+        if not isinstance(profile, dict):
+            errors.append(f"runtime profile {pid!r}: not a dict")
+
+    valid = len(errors) == 0
+    return {"valid": valid, "errors": errors, "warnings": warnings}
+
+
+def get_router_startup_status() -> dict[str, Any]:
+    return dict(_startup_validation_status)
+
+
+def get_router_analytics(limit: int = 100) -> dict[str, Any]:
+    """Aggregate routing metrics from events.jsonl. Bounded by limit."""
+    try:
+        max_limit = max(1, min(int(limit or 100), 500))
+    except Exception:
+        max_limit = 100
+    events = get_recent_events("", limit=max_limit)
+    tier_counts: dict[int, int] = {}
+    reason_counts: dict[str, int] = {}
+    task_route_hits: dict[str, int] = {}
+    provider_counts: dict[str, int] = {}
+    classifier_fallback_count = 0
+    mismatch_count = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("event") or "")
+        if event_type == "route_decision":
+            tier = event.get("tier")
+            reason = str(event.get("reason") or "")
+            provider = str(event.get("provider") or "")
+            route_name = str(event.get("route_name") or "")
+            if isinstance(tier, (int, float)) and 1 <= int(tier) <= 5:
+                k = int(tier)
+                tier_counts[k] = tier_counts.get(k, 0) + 1
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if reason == "task_route" and route_name:
+                task_route_hits[route_name] = task_route_hits.get(route_name, 0) + 1
+            if provider:
+                provider_counts[provider] = provider_counts.get(provider, 0) + 1
+        elif event_type == "classifier_fallback":
+            classifier_fallback_count += 1
+        elif event_type in ("mismatch", "router_override_mismatch"):
+            mismatch_count += 1
+    return {
+        "total_events_read": len(events),
+        "tier_counts": tier_counts,
+        "reason_counts": reason_counts,
+        "task_route_hits": task_route_hits,
+        "provider_counts": provider_counts,
+        "classifier_fallback_count": classifier_fallback_count,
+        "mismatch_count": mismatch_count,
+    }
+
+
+_DEFAULT_EVAL_FIXTURES: list[dict[str, Any]] = [
+    {"prompt": "security vulnerability in this auth module", "expected_tier": 5, "expected_reason": "task_route"},
+    {"prompt": "optimize performance of this algorithm", "expected_tier": 5, "expected_reason": "task_route"},
+    {"prompt": "architecture for this migration plan", "expected_tier": 4, "expected_reason": "task_route"},
+    {"prompt": "debug this failing test root cause", "expected_tier": 3, "expected_reason": "task_route"},
+    {"prompt": "T3 quick question about code", "expected_tier": 3, "expected_reason": "explicit_tier"},
+    {"prompt": "ok", "expected_tier": 1, "expected_reason": "ack"},
+    {"prompt": "thanks", "expected_tier": 1, "expected_reason": "ack"},
+]
+
+
+def eval_task_routing(fixtures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Deterministically evaluate task routing without calling external LLMs.
+
+    Each fixture: {prompt, expected_tier, expected_reason}.
+    Returns: {total, passed, failed, results: [{prompt, expected_tier, expected_reason, actual_tier, actual_reason, pass}]}.
+    """
+    if fixtures is None:
+        fixtures = list(_DEFAULT_EVAL_FIXTURES)
+    results: list[dict[str, Any]] = []
+    passed = 0
+    failed = 0
+    for fixture in fixtures:
+        if not isinstance(fixture, dict):
+            continue
+        prompt = str(fixture.get("prompt") or "")
+        expected_tier = int(fixture.get("expected_tier") or 0)
+        expected_reason = str(fixture.get("expected_reason") or "")
+        actual_reason = "classifier"
+        actual_tier = 0
+        explicit = _detect_explicit_tier(prompt)
+        if explicit is not None:
+            actual_tier = explicit
+            actual_reason = "explicit_tier"
+        elif _is_obvious_ack(prompt):
+            actual_tier = 1
+            actual_reason = "ack"
+        else:
+            route_match = _match_task_route(prompt)
+            if route_match is not None:
+                actual_tier = route_match["tier"]
+                actual_reason = "task_route"
+        is_pass = (actual_tier == expected_tier and actual_reason == expected_reason)
+        if is_pass:
+            passed += 1
+        else:
+            failed += 1
+        results.append({
+            "prompt": prompt[:80],
+            "expected_tier": expected_tier,
+            "expected_reason": expected_reason,
+            "actual_tier": actual_tier,
+            "actual_reason": actual_reason,
+            "pass": is_pass,
+        })
+    return {"total": len(results), "passed": passed, "failed": failed, "results": results}
+
 
 def _load_router_config() -> None:
+    global _startup_validation_status
     path = _router_config_path()
     if not path.exists():
         _apply_router_config(copy.deepcopy(DEFAULT_ROUTER_CONFIG))
+        validation = validate_router_config(_router_config)
+        _startup_validation_status = validation
         return
 
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(raw, dict):
             raise ValueError("model_router.yaml must be a mapping")
-        _apply_router_config(_normalize_router_config(raw))
+        normalized = _normalize_router_config(raw)
+        _apply_router_config(normalized)
+        validation = validate_router_config(_router_config)
+        _startup_validation_status = validation
+        if not validation["valid"]:
+            for err in validation["errors"]:
+                logger.error("model-router: config error: %s", err)
+        for warn in validation["warnings"]:
+            logger.warning("model-router: config warning: %s", warn)
         logger.info("model-router: loaded config from %s", path)
     except Exception as exc:
         logger.warning("model-router: failed to load %s: %s -- using defaults", path, exc)
         _apply_router_config(copy.deepcopy(DEFAULT_ROUTER_CONFIG))
+        _startup_validation_status = {"valid": False, "errors": [str(exc)], "warnings": []}
+
+
+def _persist_router_state() -> None:
+    try:
+        with _state_lock:
+            payload = {
+                "version": 1,
+                "session_manual": dict(_session_manual),
+                "session_pinned": dict(_session_pinned),
+                "last_tier": dict(_last_tier),
+                "base_tier": dict(_base_tier),
+                "session_runtime_state": dict(_session_runtime_state),
+                "session_working": dict(_session_working),
+                "session_floor": dict(_session_floor),
+                "mechanical_streak": dict(_mechanical_streak),
+            }
+        path = _router_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except Exception as exc:
+        logger.debug("model-router: failed to persist state: %s", exc)
+
+
+def _append_router_event(
+    event_type: str,
+    session_id: str = "",
+    **fields: Any,
+) -> None:
+    try:
+        payload = {
+            "ts": time.time(),
+            "event": str(event_type or "").strip(),
+            "session_id": str(session_id or "").strip(),
+        }
+        for key, value in fields.items():
+            if value is None:
+                continue
+            payload[str(key)] = value
+        path = _router_events_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.debug("model-router: failed to append event %r: %s", event_type, exc)
+
+
+def get_recent_events(session_id: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    path = _router_events_path()
+    if not path.exists():
+        return []
+    try:
+        max_items = max(1, min(int(limit or 20), 100))
+    except Exception:
+        max_items = 20
+    session_filter = str(session_id or "").strip()
+    events: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if session_filter and str(item.get("session_id") or "") != session_filter:
+                    continue
+                events.append(item)
+        return events[-max_items:]
+    except Exception as exc:
+        logger.debug("model-router: failed to read events: %s", exc)
+        return []
+
+
+def _load_persisted_state() -> None:
+    path = _router_state_path()
+    if not path.exists():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        with _state_lock:
+            for key, target in (
+                ("session_manual", _session_manual),
+                ("session_pinned", _session_pinned),
+                ("last_tier", _last_tier),
+                ("base_tier", _base_tier),
+                ("session_runtime_state", _session_runtime_state),
+                ("session_working", _session_working),
+                ("session_floor", _session_floor),
+                ("mechanical_streak", _mechanical_streak),
+            ):
+                incoming = raw.get(key, {})
+                if isinstance(incoming, dict):
+                    target.clear()
+                    target.update(incoming)
+        logger.info("model-router: restored persisted state from %s", path)
+    except Exception as exc:
+        logger.debug("model-router: failed to restore persisted state: %s", exc)
+
+
+def get_router_diagnostics(session_id: str = "", limit: int = 10) -> dict[str, Any]:
+    session_filter = str(session_id or "").strip()
+    state = get_session_state(session_filter) if session_filter else {}
+    diagnostics = {
+        "session_id": session_filter,
+        "state": state,
+        "recent_events": get_recent_events(session_filter, limit=limit),
+    }
+    if state:
+        diagnostics["pinned"] = bool(state.get("pinned"))
+        diagnostics["tier"] = int(state.get("tier") or state.get("last_tier") or 0)
+        diagnostics["profile_id"] = str(state.get("profile_id") or "")
+        diagnostics["model"] = str(state.get("model") or "")
+        diagnostics["provider"] = str(state.get("provider") or "")
+        diagnostics["api_mode"] = str(state.get("api_mode") or "")
+        diagnostics["route_reason"] = str(state.get("route_reason") or "")
+        diagnostics["route_name"] = state.get("route_name")
+        diagnostics["route_keyword"] = state.get("route_keyword")
+    diagnostics["startup_validation"] = dict(_startup_validation_status)
+    return diagnostics
 
 
 _apply_router_config(copy.deepcopy(DEFAULT_ROUTER_CONFIG))
+_startup_validation_status = validate_router_config(_router_config)
 
 # ---------------------------------------------------------------------------
 # Explicit tier/model request detection
@@ -338,6 +929,27 @@ def _detect_explicit_tier(msg: str) -> int | None:
 # Fast-path heuristic: obvious short ACKs -> T1, no Flash call
 # ---------------------------------------------------------------------------
 
+def _match_task_route(msg: str) -> dict[str, Any] | None:
+    """Return first task-route match (highest priority) or None. Never raises."""
+    if not TASK_ROUTES or not msg:
+        return None
+    search_text = msg[:800].lower()
+    try:
+        for route in TASK_ROUTES:
+            for keyword in route["keywords"]:
+                if keyword in search_text:
+                    return {
+                        "name": route["name"],
+                        "tier": route["tier"],
+                        "working_tier": route.get("working_tier", route["tier"]),
+                        "floor_tier": route.get("floor_tier", route["tier"]),
+                        "keyword": keyword,
+                    }
+    except Exception as exc:
+        logger.debug("model-router: task route matching error: %s", exc)
+    return None
+
+
 _ACK_RE = re.compile(
     r"^(ok|okay|thanks|thank you|thx|got it|understood|sure|yes|no|yep|nope|"
     r"alright|cool|great|nice|perfect|done|noted|ack|"
@@ -362,11 +974,11 @@ _CLASSIFIER_SYSTEM = """\
 You are a model routing classifier. Your only job is to assign a tier number (1-5) to the user's message based on task complexity.
 
 Tier definitions:
-1 = Ultra-cheap: short acknowledgements, status checks, title generation, <4 word messages
-2 = Default: normal day-to-day work, content drafting, Q&A, file operations, SEO research, standard coding
-3 = Stronger: debugging with multiple causes, code review, large-doc summarization, nuanced analysis
-4 = Planner: architecture decisions, system design, multi-step plans, migration planning, workflow design
-5 = Deep-think: security analysis, cryptography, algorithmic optimization (complexity/performance), financial modelling, high-stakes with many interacting constraints
+1 = General & Coding: normal day-to-day work, standard coding, content drafting, Q&A, file operations, status checks, short acknowledgements (default/primary tier)
+2 = Enhanced: tasks requiring slightly more reasoning or multi-file context, simple debugging
+3 = Analysis: standard troubleshooting, debugging, code reviews, nuanced logical analysis
+4 = Architecture: system design, architecture planning, multi-step implementation plans, migration strategy
+5 = Deep-think: multi-file refactors, complex debugging, security auditing, algorithmic optimization, high-stakes tasks with many interacting constraints
 
 Rules:
 - When unsure between two tiers, pick the LOWER one
@@ -470,8 +1082,12 @@ def _classify_with_flash(user_message: str, conversation_history: list) -> int:
             logger.warning("model-router: classifier fallback %r/%s failed: %s", fb_provider, fb_model, exc)
             _mark_provider_failed(fb_provider)
 
-    logger.warning("model-router: all classifier providers exhausted -- defaulting T2")
-    return 2
+    safe_tier = int(_router_config.get("safe_tier", 2) or 2)
+    if safe_tier not in range(1, 6):
+        safe_tier = 2
+    logger.warning("model-router: all classifier providers exhausted -- defaulting T%d", safe_tier)
+    _append_router_event("classifier_fallback", reason="all_providers_exhausted", safe_tier=safe_tier)
+    return safe_tier
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +1102,9 @@ _last_tier:       dict[str, int] = {}              # session_id -> current assig
 _base_tier:       dict[str, int] = {}              # session_id -> tier for this turn (before escalation)
 _tool_errors:     dict[str, int] = {}              # session_id -> consecutive tool error count this turn
 _escalated:       dict[str, bool] = {}             # session_id -> True if we already escalated mid-turn
+_session_working: dict[str, int] = {}              # session_id -> working tier for this turn
+_session_floor:   dict[str, int] = {}              # session_id -> floor tier for this turn
+_mechanical_streak: dict[str, int] = {}            # session_id -> consecutive read-only tools
 _live_agents:     dict[str, Any] = {}              # session_id -> active agent bound by WebUI/CLI bridge
 _live_tui_sessions: dict[str, tuple[str, dict]] = {}  # session_id -> (tui_sid, session_dict) for TUI mode
 _session_ts:      dict[str, float] = {}            # session_id -> last-seen monotonic timestamp
@@ -507,10 +1126,13 @@ def _evict_stale_sessions() -> None:
         for sid in stale:
             for d in (
                 _session_last, _session_manual, _session_pinned, _last_tier,
-                _base_tier, _tool_errors, _escalated, _live_agents, _live_tui_sessions, _session_ts,
+                _base_tier, _tool_errors, _escalated, _live_agents, _live_tui_sessions,
+                _session_runtime_state, _session_route_trace, _session_ts,
+                _session_working, _session_floor, _mechanical_streak,
             ):
                 d.pop(sid, None)
     if stale:
+        _persist_router_state()
         logger.debug("model-router: evicted %d stale session(s)", len(stale))
 
 
@@ -537,31 +1159,13 @@ def _is_provider_healthy(provider: str) -> bool:
 
 
 def _select_tier_entry(tier: int) -> tuple[str, str | None, str]:
-    """Return (model, reasoning, provider) for tier, skipping unhealthy primary provider.
-
-    Falls through the PROVIDER_PRIORITY order.  Returns the primary entry if
-    no fallback improves things (caller handles the error naturally).
-    """
-    tier_data = TIERS.get(tier, {})
-    primary_model     = tier_data.get("model", "")
-    primary_reasoning = tier_data.get("reasoning")
-    primary_provider  = str(tier_data.get("provider") or (PROVIDER_PRIORITY[0] if PROVIDER_PRIORITY else "")).strip()
-
-    if _is_provider_healthy(primary_provider):
-        return primary_model, primary_reasoning, primary_provider
-
-    for fb in TIER_FALLBACKS.get(tier, []):
-        fb_provider = str(fb.get("provider") or "").strip()
-        fb_model    = str(fb.get("model") or "").strip()
-        if fb_provider and fb_model and _is_provider_healthy(fb_provider):
-            logger.info(
-                "model-router: T%d primary provider %r unhealthy; using fallback %r/%s",
-                tier, primary_provider, fb_provider, fb_model,
-            )
-            return fb_model, fb.get("reasoning", primary_reasoning), fb_provider
-
-    # All providers unhealthy — use primary and let hermes handle the error
-    return primary_model, primary_reasoning, primary_provider
+    """Back-compat helper returning the resolved runtime tuple for a tier."""
+    runtime = resolve_tier_runtime(tier)
+    return (
+        str(runtime.get("model") or ""),
+        runtime.get("reasoning"),
+        str(runtime.get("provider") or ""),
+    )
 
 
 def _sync_tier_fallbacks_to_config(tier: int) -> None:
@@ -657,12 +1261,90 @@ def _record_router_set(session_id: str) -> None:
         _session_manual.pop(session_id, None)
 
 
+def _record_route_trace(
+    session_id: str,
+    reason: str,
+    tier: int,
+    profile_id: str = "",
+    model: str = "",
+    provider: str = "",
+    route_name: str | None = None,
+    route_keyword: str | None = None,
+) -> None:
+    """Record the routing decision reason for this session."""
+    if not session_id:
+        return
+    trace: dict[str, Any] = {
+        "reason": reason,
+        "tier": tier,
+        "profile_id": profile_id,
+        "model": model,
+        "provider": provider,
+        "updated_at": time.time(),
+    }
+    if route_name:
+        trace["route_name"] = route_name
+    if route_keyword:
+        trace["route_keyword"] = route_keyword
+    with _state_lock:
+        _session_route_trace[session_id] = trace
+
+
+def _record_runtime_state(session_id: str, runtime: dict[str, Any], tier: int) -> None:
+    if not session_id:
+        return
+    state = {
+        "tier": tier,
+        "profile_id": str(runtime.get("profile_id") or ""),
+        "display_name": str(runtime.get("display_name") or ""),
+        "model": str(runtime.get("model") or ""),
+        "provider": str(runtime.get("provider") or ""),
+        "base_url": str(runtime.get("base_url") or ""),
+        "api_mode": str(runtime.get("api_mode") or ""),
+        "reasoning": runtime.get("reasoning"),
+        "updated_at": time.time(),
+    }
+    with _state_lock:
+        _session_runtime_state[session_id] = state
+    _persist_router_state()
+    _append_router_event(
+        "runtime_state_updated",
+        session_id,
+        tier=tier,
+        profile_id=state["profile_id"],
+        model=state["model"],
+        provider=state["provider"],
+        api_mode=state["api_mode"],
+        reasoning=state["reasoning"],
+    )
+
+
+def get_session_state(session_id: str) -> dict[str, Any]:
+    with _state_lock:
+        state = dict(_session_runtime_state.get(session_id, {}))
+        state["pinned"] = _session_pinned.get(session_id, False)
+        state["last_tier"] = _last_tier.get(session_id, 0)
+        state["base_tier"] = _base_tier.get(session_id, 0)
+        trace = dict(_session_route_trace.get(session_id, {}))
+    if trace:
+        state["route_reason"] = trace.get("reason", "")
+        state["route_name"] = trace.get("route_name")
+        state["route_keyword"] = trace.get("route_keyword")
+    return state
+
+
 def notify_manual_override(session_id: str, model: str) -> None:
     """Called when we auto-detect a /model change mid-session.
     Sets the session pin so we stop routing for this session."""
     with _state_lock:
         _session_manual[session_id] = model
         _session_pinned[session_id] = True
+        known_tier = MODEL_TO_TIER.get(str(model or ""), 0)
+        if known_tier:
+            _last_tier[session_id] = known_tier
+            _base_tier[session_id] = known_tier
+    _persist_router_state()
+    _append_router_event("manual_override_detected", session_id, model=model)
 
 
 def pin_session(session_id: str, model: str) -> None:
@@ -671,6 +1353,8 @@ def pin_session(session_id: str, model: str) -> None:
     with _state_lock:
         _session_manual[session_id] = model
         _session_pinned[session_id] = True
+    _persist_router_state()
+    _append_router_event("session_pinned", session_id, model=model)
     logger.info("model-router: session %s pinned to %s", session_id, model)
 
 
@@ -681,6 +1365,9 @@ def unpin_session(session_id: str) -> None:
         _session_pinned.pop(session_id, None)
         # Also clear cache so next turn re-classifies fresh
         _session_last.pop(session_id, None)
+        _session_runtime_state.pop(session_id, None)
+    _persist_router_state()
+    _append_router_event("session_unpinned", session_id)
     logger.info("model-router: session %s unpinned, auto-routing resumed", session_id)
 
 
@@ -707,27 +1394,41 @@ def _patch_status_bar(cli) -> None:
             session_id = getattr(getattr(self_cli, "agent", None), "session_id", None) or ""
             tier = get_last_tier(session_id)
             if tier:
-                prefix = f"[T{tier}] "
                 # Read the model name from agent.model directly so the badge
                 # and the model name always match (agent.model may have changed
                 # since the original snapshot was captured).
                 agent = getattr(self_cli, "agent", None)
                 current_model = getattr(agent, "model", "") if agent else ""
                 if not current_model:
-                    # Fallback to tier's default model if agent.model is somehow empty
                     current_model = TIERS.get(tier, {}).get("model", "")
-                # Extract a short display name:
-                #   openai/gpt-5.5          → gpt-5.5
-                #   global.anthropic.claude-sonnet-4-6 → claude-sonnet-4-6
-                #   us.anthropic.claude-opus-4-8      → claude-opus-4-8
-                #   bare-model-id                     → bare-model-id
+                # Extract a short display name, stripping path prefix and
+                # Bedrock inference-profile region prefixes.
                 name_only = current_model.split("/")[-1] if current_model else "unknown"
-                # Strip Bedrock inference-profile prefixes
-                for prefix in ("global.anthropic.", "us.anthropic.", "eu.anthropic.", "apac.anthropic."):
-                    if name_only.startswith(prefix):
-                        name_only = name_only[len(prefix):]
+                for _bedrock_pfx in ("global.anthropic.", "us.anthropic.", "eu.anthropic.", "apac.anthropic."):
+                    if name_only.startswith(_bedrock_pfx):
+                        name_only = name_only[len(_bedrock_pfx):]
                         break
-                snap["model_short"] = prefix + name_only
+                # Read provider from runtime state; fall back to the tier's *primary*
+                # configured provider for new sessions (avoids showing a fallback provider).
+                _provider_raw = ""
+                with _state_lock:
+                    _provider_raw = str(_session_runtime_state.get(session_id, {}).get("provider") or "")
+                if not _provider_raw:
+                    try:
+                        _pid = _tier_profile_id(tier)
+                        _primary = RUNTIME_PROFILES.get(_pid, {})
+                        _provider_raw = str(
+                            _primary.get("provider")
+                            or TIERS.get(tier, {}).get("provider")
+                            or ""
+                        )
+                    except Exception:
+                        pass
+                provider_short = _PROVIDER_SHORT.get(_provider_raw.lower(), _provider_raw[:6]) if _provider_raw else ""
+                if provider_short:
+                    snap["model_short"] = f"[{provider_short}|T{tier}] {name_only}"
+                else:
+                    snap["model_short"] = f"[T{tier}] {name_only}"
             return snap
 
         cli._get_status_bar_snapshot = types.MethodType(_patched_snapshot, cli)
@@ -809,27 +1510,82 @@ def _target_tier_for_turn(session_id: str, msg: str, history: list, current_mode
             _tool_errors[session_id] = 0
             _escalated[session_id] = False
             _session_ts[session_id] = time.monotonic()
+            _mechanical_streak[session_id] = 0
+
+        route_match: dict[str, Any] | None = None
+        route_reason = "classifier"
 
         explicit = _detect_explicit_tier(msg)
         if explicit is not None:
             target_tier = explicit
+            working = target_tier
+            floor = target_tier
+            route_reason = "explicit_tier"
             _set_cached_tier(session_id, msg, target_tier)
             logger.info("model-router: explicit T%d request honoured", target_tier)
         elif _is_obvious_ack(msg):
             target_tier = 1
+            working = target_tier
+            floor = target_tier
+            route_reason = "ack"
             _set_cached_tier(session_id, msg, target_tier)
         else:
-            target_tier = _classify_with_flash(msg, history)
-            _set_cached_tier(session_id, msg, target_tier)
+            route_match = _match_task_route(msg)
+            if route_match is not None:
+                target_tier = route_match["tier"]
+                working = route_match["working_tier"]
+                floor = route_match["floor_tier"]
+                route_reason = "task_route"
+                _set_cached_tier(session_id, msg, target_tier)
+                logger.info(
+                    "model-router: task route %r matched keyword %r -> T%d [working T%d, floor T%d]",
+                    route_match["name"], route_match["keyword"], target_tier, working, floor,
+                )
+            else:
+                target_tier = _classify_with_flash(msg, history)
+                working = target_tier
+                delta = int(_router_config.get("default_floor_delta", 2) or 2)
+                floor = max(1, target_tier - delta)
+                _set_cached_tier(session_id, msg, target_tier)
 
         with _state_lock:
             _base_tier[session_id] = target_tier
             _last_tier[session_id] = target_tier
+            _session_working[session_id] = working
+            _session_floor[session_id] = floor
+
+        _rt = resolve_tier_runtime(target_tier)
+        _rt_profile_id = str(_rt.get("profile_id") or "")
+        _rt_model = str(_rt.get("model") or "")
+        _rt_provider = str(_rt.get("provider") or "")
+        _record_route_trace(
+            session_id, route_reason, target_tier,
+            profile_id=_rt_profile_id, model=_rt_model, provider=_rt_provider,
+            route_name=route_match["name"] if route_match else None,
+            route_keyword=route_match["keyword"] if route_match else None,
+        )
+        _append_router_event(
+            "route_decision",
+            session_id,
+            reason=route_reason,
+            tier=target_tier,
+            profile_id=_rt_profile_id,
+            model=_rt_model,
+            provider=_rt_provider,
+            route_name=route_match["name"] if route_match else None,
+            route_keyword=route_match["keyword"] if route_match else None,
+        )
         return target_tier, True
 
     with _state_lock:
         _session_ts[session_id] = time.monotonic()
-        return _last_tier.get(session_id, 2), False
+        last_tier = _last_tier.get(session_id, 2)
+        if session_id not in _session_working:
+            _session_working[session_id] = last_tier
+        if session_id not in _session_floor:
+            delta = int(_router_config.get("default_floor_delta", 2) or 2)
+            _session_floor[session_id] = max(1, last_tier - delta)
+        return last_tier, False
 
 
 def prepare_turn(
@@ -861,19 +1617,24 @@ def prepare_turn(
         actual_model = getattr(agent, "model", actual_model) or actual_model
 
     if _is_manual_override(session_id, actual_model):
+        state = get_session_state(session_id)
         logger.debug("model-router: manual override active (%s), skipping", actual_model)
         return {
             "session_id": session_id,
             "pinned": True,
-            "tier": MODEL_TO_TIER.get(actual_model, get_last_tier(session_id)),
+            "tier": state.get("tier") or MODEL_TO_TIER.get(actual_model, get_last_tier(session_id)),
             "model": actual_model,
-            "reasoning": getattr(agent, "reasoning_config", None) if agent is not None else None,
+            "reasoning": state.get("reasoning")
+            or (getattr(agent, "reasoning_config", None) if agent is not None else None),
             "platform": platform,
             "is_new_turn": False,
         }
 
     target_tier, is_new_user_turn = _target_tier_for_turn(session_id, msg, history, actual_model)
-    target_model, target_reasoning, target_provider = _select_tier_entry(target_tier)
+    target_runtime = resolve_tier_runtime(target_tier)
+    target_model = str(target_runtime.get("model") or "")
+    target_reasoning = target_runtime.get("reasoning")
+    target_provider = str(target_runtime.get("provider") or "")
     if not target_model:
         target_model = actual_model
     actual_provider = getattr(agent, "provider", "") if agent is not None else ""
@@ -955,14 +1716,17 @@ def _sync_fallback_chain(agent: Any, target_tier: int) -> None:
 def _apply_tier(session_id: str, target_tier: int, current_model: str, source: str = "") -> None:
     """Switch agent.model + reasoning_config to target_tier. Emits badge.
 
-    Uses _select_tier_entry to skip unhealthy primary providers.
+    Uses provider-correct runtime profile resolution for the selected tier.
     """
     global _manager_ref
 
     if _manager_ref is None:
         return
 
-    target_model, target_reasoning, provider = _select_tier_entry(target_tier)
+    runtime = resolve_tier_runtime(target_tier)
+    target_model = str(runtime.get("model") or "")
+    target_reasoning = runtime.get("reasoning")
+    provider = str(runtime.get("provider") or "")
     current_tier = MODEL_TO_TIER.get(current_model, 2)
 
     # Apply status bar patch lazily (needs cli ref)
@@ -977,17 +1741,13 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
         cli = _manager_ref._cli_ref
         agent = _get_live_agent(session_id)
         if agent is None:
+            _record_runtime_state(session_id, runtime, target_tier)
             return
 
         old_model = agent.model
         old_provider = getattr(agent, "provider", "") or ""
-        base_url = _PROVIDER_BASE_URLS.get(provider, "")
-        api_mode = ""
-        try:
-            from hermes_cli.providers import determine_api_mode  # type: ignore
-            api_mode = determine_api_mode(provider, base_url)
-        except Exception:
-            api_mode = "bedrock_converse" if provider == "bedrock" else "chat_completions"
+        base_url = str(runtime.get("base_url") or _PROVIDER_BASE_URLS.get(provider, "")).strip()
+        api_mode = str(runtime.get("api_mode") or _determine_api_mode(provider, base_url)).strip()
 
         # In TUI mode, invoke the proper switch mechanism so the shared client,
         # provider, base_url, api_mode, and status bar all update via the same
@@ -1024,11 +1784,13 @@ def _apply_tier(session_id: str, target_tier: int, current_model: str, source: s
                 agent.api_mode = api_mode
 
         if target_reasoning:
-            agent.reasoning_config = {"effort": target_reasoning}
+            normalized_reasoning = _normalize_reasoning_for_provider(target_reasoning, provider)
+            agent.reasoning_config = {"effort": normalized_reasoning} if normalized_reasoning else None
         else:
             agent.reasoning_config = None
 
         _record_router_set(session_id)
+        _record_runtime_state(session_id, runtime, target_tier)
 
         with _state_lock:
             _last_tier[session_id] = target_tier
@@ -1090,6 +1852,16 @@ def on_pre_llm_call(
 # Hook: post_tool_call  (fires after every tool execution inside the loop)
 # ---------------------------------------------------------------------------
 
+_READ_ONLY_TOOLS = {
+    "read_file", "view_file", "list_dir", "grep_search", "search_files",
+    "web_search", "web_extract", "x_search", "session_search",
+    "read_terminal", "skills_list", "skill_view", "vision_analyze",
+    "video_analyze", "memory", "read_resource", "list_resources",
+    "read_url_content", "list_permissions"
+}
+
+_MECHANICAL_STREAK_THRESHOLD = 1
+
 # How many consecutive tool errors trigger a self-escalation
 _ESCALATION_ERROR_THRESHOLD = 2
 
@@ -1101,16 +1873,18 @@ def on_post_tool_call(
     **kwargs: Any,
 ) -> None:
     """Self-escalation: if the agent keeps hitting tool errors, bump one tier.
+    Also implements per-call routing heuristics: read-only sequences drop to
+    the task floor; errors or write/exec tools restore the working tier.
 
     Only escalates ONCE per turn (guards against ping-pong).
     Only escalates if currently below T4 (T4/T5 are already the strongest).
     Resets error counter on success.
-    Does NOT escalate if session is pinned by user via /model or /tN.
+    Does NOT escalate/downgrade if session is pinned by user via /model or /tN.
     """
     if _manager_ref is None or not session_id:
         return
 
-    # Respect session pin — never auto-escalate a pinned session
+    # Respect session pin — never auto-escalate or downgrade a pinned session
     with _state_lock:
         if _session_pinned.get(session_id, False):
             return
@@ -1160,6 +1934,54 @@ def on_post_tool_call(
             current_tier, new_tier, error_count,
         )
         _apply_tier(session_id, new_tier, current_model, source="auto-escalate")
+
+    # Step 3 — Per-call heuristic downgrade/restore logic
+    is_read_only = bool(tool_name and tool_name in _READ_ONLY_TOOLS)
+
+    with _state_lock:
+        working = _session_working.get(session_id)
+        floor = _session_floor.get(session_id)
+        # Fallback initialization if missing
+        if working is None or floor is None:
+            base = _base_tier.get(session_id, 2)
+            if working is None:
+                working = base
+                _session_working[session_id] = working
+            if floor is None:
+                delta = int(_router_config.get("default_floor_delta", 2) or 2)
+                floor = max(1, working - delta)
+                _session_floor[session_id] = floor
+
+        # Fetch current tier again (in case it was escalated above)
+        current_tier = _last_tier.get(session_id, 2)
+
+    if not is_read_only or is_error:
+        with _state_lock:
+            _mechanical_streak[session_id] = 0
+        if current_tier < working:
+            with _state_lock:
+                _last_tier[session_id] = working
+            agent = _get_live_agent(session_id)
+            current_model = getattr(agent, "model", TIERS[current_tier]["model"]) if agent else TIERS[current_tier]["model"]
+            logger.info(
+                "model-router: restoring working tier T%d (was T%d) due to %s",
+                working, current_tier, "tool error" if is_error else f"non-read-only tool {tool_name}"
+            )
+            _apply_tier(session_id, working, current_model, source="restore-working")
+    else:
+        with _state_lock:
+            streak = _mechanical_streak.get(session_id, 0) + 1
+            _mechanical_streak[session_id] = streak
+        if streak >= _MECHANICAL_STREAK_THRESHOLD and current_tier > floor:
+            with _state_lock:
+                _last_tier[session_id] = floor
+            agent = _get_live_agent(session_id)
+            current_model = getattr(agent, "model", TIERS[current_tier]["model"]) if agent else TIERS[current_tier]["model"]
+            logger.info(
+                "model-router: downgrading to floor tier T%d (was T%d) after %d read-only tool(s)",
+                floor, current_tier, streak
+            )
+            _apply_tier(session_id, floor, current_model, source="mechanical-floor")
 
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +2034,37 @@ def on_post_llm_call(
                 )
                 return
 
+        # Sync status bar if _try_activate_fallback() changed the model mid-turn.
+        # _session_runtime_state is only updated by _apply_tier(); when the hermes
+        # fallback chain fires during an API call our recorded model/provider drifts
+        # from agent.model. Fix both the CLI provider badge and the TUI session.info
+        # display by snapshotting the actual runtime here (fires after every LLM
+        # response, so the lag is at most one round-trip).
+        if getattr(agent, "_fallback_activated", False):
+            _fb_model = getattr(agent, "model", "")
+            _fb_provider = getattr(agent, "provider", "")
+            with _state_lock:
+                _fb_recorded = dict(_session_runtime_state.get(session_id, {}))
+            if _fb_model and (
+                _fb_model != _fb_recorded.get("model")
+                or _fb_provider != _fb_recorded.get("provider")
+            ):
+                _fb_recorded["model"] = _fb_model
+                _fb_recorded["provider"] = _fb_provider
+                with _state_lock:
+                    _session_runtime_state[session_id] = _fb_recorded
+                with _state_lock:
+                    _fb_tui_ctx = _live_tui_sessions.get(session_id)
+                if _fb_tui_ctx is not None and _tui_server_module is not None:
+                    try:
+                        _fb_tui_sid, _fb_tui_sess = _fb_tui_ctx
+                        _tui_server_module._emit(
+                            "session.info", _fb_tui_sid,
+                            _tui_server_module._session_info(agent, _fb_tui_sess),
+                        )
+                    except Exception as _fb_exc:
+                        logger.debug("model-router: fallback status sync failed: %s", _fb_exc)
+
         # If already pinned, do nothing (no de-escalation either)
         if already_pinned:
             return
@@ -1222,10 +2075,10 @@ def on_post_llm_call(
             base = _base_tier.get(session_id, 2)
             current = _last_tier.get(session_id, 2)
 
-        if was_escalated and current > base:
+        if (was_escalated and current > base) or (current < base):
             logger.info(
-                "model-router: de-escalating T%d->T%d after heavy work completed",
-                current, base,
+                "model-router: restoring base/working tier T%d (was T%d) after turn completed",
+                base, current,
             )
             with _state_lock:
                 _escalated[session_id] = False
@@ -1295,6 +2148,7 @@ def on_api_request_error(
 def register(ctx) -> None:
     global _manager_ref
     _load_router_config()
+    _load_persisted_state()
     _manager_ref = ctx._manager
     ctx.register_hook("pre_llm_call",          on_pre_llm_call)
     ctx.register_hook("post_llm_call",         on_post_llm_call)
@@ -1311,9 +2165,17 @@ def register(ctx) -> None:
     mgr.router_pin_session   = pin_session
     mgr.router_unpin_session = unpin_session
     mgr.router_apply_tier    = _apply_tier_by_num
+    mgr.router_resolve_tier_runtime = resolve_tier_runtime
     mgr.router_is_pinned     = is_session_pinned
     mgr.router_get_tier      = get_last_tier
     mgr.router_get_tier_meta = get_tier_meta
+    mgr.router_get_session_state = get_session_state
+    mgr.router_get_recent_events = get_recent_events
+    mgr.router_get_diagnostics = get_router_diagnostics
+    mgr.router_get_startup_status = get_router_startup_status
+    mgr.router_get_analytics = get_router_analytics
+    mgr.router_eval_routing = eval_task_routing
+    mgr.router_reload_config = _load_router_config
     mgr.router_prepare_turn  = prepare_turn
     mgr.router_bind_agent    = bind_session_agent
     mgr.router_unbind_agent  = unbind_session_agent
@@ -1340,10 +2202,18 @@ def get_tier_meta(tier_num: int) -> dict[str, Any]:
     """Return model metadata for a tier so the CLI does not hardcode slugs."""
     if tier_num not in TIERS:
         return {}
-    return dict(_router_config["tiers"][tier_num])
+    meta = dict(_router_config["tiers"][tier_num])
+    runtime = resolve_tier_runtime(tier_num)
+    if runtime:
+        meta.setdefault("target", runtime.get("profile_id"))
+        meta["provider"] = runtime.get("provider") or meta.get("provider")
+        meta["base_url"] = runtime.get("base_url") or meta.get("base_url", "")
+        meta["api_mode"] = runtime.get("api_mode") or meta.get("api_mode", "")
+        meta["display_name"] = runtime.get("display_name") or meta.get("label")
+    return meta
 
 
-def _apply_tier_by_num(session_id: str, tier_num: int, current_model: str) -> None:
+def _apply_tier_by_num(session_id: str, tier_num: int, current_model: str) -> dict[str, Any]:
     """Public entry point for /t1-/t5 slash commands.
 
     Sets the tier, applies the model switch, and pins the session so
@@ -1351,10 +2221,16 @@ def _apply_tier_by_num(session_id: str, tier_num: int, current_model: str) -> No
     """
     if tier_num not in TIERS:
         logger.warning("model-router: invalid tier %d requested", tier_num)
-        return
-    target_model = TIERS[tier_num]["model"]
+        return {}
+    runtime = resolve_tier_runtime(tier_num)
+    target_model = str(runtime.get("model") or TIERS[tier_num]["model"])
     pin_session(session_id, target_model)
     with _state_lock:
         _last_tier[session_id] = tier_num
         _base_tier[session_id] = tier_num
     _apply_tier(session_id, tier_num, current_model, source="user-pin")
+    state = get_session_state(session_id)
+    if state:
+        runtime = dict(runtime)
+        runtime["tier"] = state.get("tier", tier_num)
+    return runtime
