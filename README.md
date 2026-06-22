@@ -1,6 +1,6 @@
-# model-router
+# model-router-advanced for Nous Hermes 
 
-Automatic cost-aware model routing for Hermes Agent. Fork of model-router by Jakub Misiak.
+Automatic cost-aware model routing for Hermes Agent. Fork of model-router by Jakub Misiak. Now supports provider fallbacks, preferences, per-call task-band routing, and model status indication.
 
 ## Fork Differences from Upstream
 
